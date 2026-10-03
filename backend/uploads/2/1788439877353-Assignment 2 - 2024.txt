@@ -1,0 +1,9 @@
+Tóm lược từ 10 đến 12  slides các chương:
+5 Sockets .
+6 Socket-Based Client–Server Communication
+7 Support for Communication-Based Services
+trong giáo trình: Advanced Network Programming – Principles and Techniques (73-154)
+
+Nộp lên Elearnning đứng tiên độ, hạn cuối ngày:  8.2024
+Lưu ý: - đặt tên file đúng như đã hướng dẫn
+       - chuẫn bị lên thuyết trình trước lớp

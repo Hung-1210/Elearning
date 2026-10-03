@@ -1,0 +1,13 @@
+﻿Hãy tạo chương trình net send đơn giản.
+
+Cho phép người dùng gửi tin nhắn đến một máy nào đó hoặc một nhóm máy hoặc tất cả các máy của một mạng
+Chương trình cho phép người dùng thực hiện lệnh
+net send {IP  group   } message  
+
+IP  của một máy tính đích.
+
+Group đến tất cả các máy thuộc group
+
+  gửi đến tất cả các máy trên mạng  
+
+Máy nhận được tin nhắn sẽ hiển thị tin nhắn trên màn hình cùng với địa chỉ IP máy gửi

@@ -1,0 +1,10 @@
+Tóm lược từ 10-12 slides các chương:
+2 Network Architectures
+3 Network Communications Protocols and Services ..
+4 Basic Network Programming
+trong giáo trình: Advanced Network Programming – Principles and Techniques (3-72)
+
+
+nộp lên elearning hạn cuối: 8.2024
+lưu ý: - đặt đúng tên file như đã hướng dẫn
+       - chuẫn bị lên thuyết trình trước lớp

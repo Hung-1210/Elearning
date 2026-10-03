@@ -1,0 +1,5 @@
+﻿P2P
+Viết ứng dụng chat theo mô hình P2P
+Gợi ý: tham khảo cách hoạt động của Skype
+Viết ứng dụng truyền file
+Gợi ý: tham khảo cách hoạt động của Napster, Gnutella, Kazaa

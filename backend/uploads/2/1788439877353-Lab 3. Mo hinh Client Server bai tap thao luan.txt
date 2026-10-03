@@ -1,0 +1,10 @@
+﻿2 hoặc 3 SV lập thành một nhóm để thảo luận cách xây dựng ứng dụng client/server nào đó mà GV yêu cầu:
+Sơ đồ hoạt động
+Các chức năng phía server
+Các chức năng phía client
+Các tình huống
+Các thuật toán
+Cách tổ chức và quản lý dữ liệu
+cụ thể: web, ftp,mail,..
+mô hình p2p:vi dụ sky,zalo,...
+…  

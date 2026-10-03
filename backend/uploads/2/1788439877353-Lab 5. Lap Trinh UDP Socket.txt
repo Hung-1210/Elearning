@@ -1,0 +1,12 @@
+﻿Bài 1. Xây dựng chương trình ExchangeRate
+ExchangeRateServer 
+chạy trên máy chủ và đón nhận dữ liệu do máy khách gửi đến cổng 2345. Khi nhận được yêu cầu, máy chủ sẽ gửi trả các thông báo về tỉ giá kèm theo ngày giờ mới nhất về cho máy khách. Có thể dùng các hàng random để lấy giá trị ngẫu nhiên của 3 thị trường là Tokyo, Newyork, và Hồng kông
+ExchangeRateTable
+Chạy trên máy khách, nó chịu trách nhiệm mỗi giây yêu cầu đến máy chủ để cập nhật thông tin về tỉ giá của thị trường chứng khoán.
+
+
+Bài 2. Hãy tạo chương trình Mail Server.
+Mỗi khi người dùng tạo account mới tại các máy client, thì chương trình server sẽ tạo một thư mục tương ứng ở máy server, đồng thời tạo một file có tên new_email.txt trong thư mục đó có nội dung như sau :
+“Thank you for using this service. we hope that you will feel comfortabl........”
+Mỗi khi người dùng gửi một email, chương trình server nhận được email đó, xác định gửi đến account nào, tại thư mục của account đó chương trình server sẽ tạo một file có nội dung là nội dung email đó.   
+Mỗi khi người dùng ở máy client đăng nhập vào một account, thì chương trình server phải mở thư mục tương ứng với account đó ở server và gửi tất cả các tên file của thư mục đó về client 

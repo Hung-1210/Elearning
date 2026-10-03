@@ -1,0 +1,40 @@
+{
+  "name": "elearning-backend",
+  "version": "1.0.0",
+  "description": "Elearning Backend - Node.js + Express + TypeScript + PostgreSQL",
+  "main": "dist/server.js",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "db:migrate": "node -r tsx/esm src/scripts/migrate.ts"
+  },
+  "dependencies": {
+    "@types/cookie-parser": "^1.4.10",
+    "archiver": "^7.0.1",
+    "bcrypt": "^5.1.1",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5-lts.1",
+    "node-xlsx": "^0.24.0",
+    "pg": "^8.13.3",
+    "socket.io": "^4.8.1",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/archiver": "^6.0.3",
+    "@types/bcrypt": "^5.0.2",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.1",
+    "@types/jsonwebtoken": "^9.0.7",
+    "@types/multer": "^1.4.12",
+    "@types/node": "^22.13.10",
+    "@types/pg": "^8.11.11",
+    "@types/uuid": "^10.0.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.7.3"
+  }
+}
