@@ -1,5 +1,26 @@
 node_modules/
 
-AI/
+AI/hopenet_final.pth
+
+AI/l2cs_gaze_final.pth
+
+AI/yolov8_exam_proctor_final.pt
+
+AI/venv
+
+AI/_pycache_
+
+AI/tests
 
 .env
+
+UI/ 
+
+uploads/
+private-uploads/
+
+backend-context-ai-proctored-exam.md
+
+HARD-TASK-ROADMAP.md
+
+plan-module-thi-online-backend.md

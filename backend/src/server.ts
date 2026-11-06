@@ -15,6 +15,9 @@ import classRoutes from './routes/class.routes.js';
 import exerciseRoutes from './routes/exercise.routes.js';
 import documentRoutes from './routes/document.routes.js';
 import meetingRoutes from './routes/meeting.routes.js';
+import examRoutes from './routes/exam.routes.js';
+import { registerMonitorNamespace } from './sockets/monitor.socket.js';
+import { startProctoringJobs } from './jobs/proctoring.jobs.js';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3001');
@@ -27,8 +30,8 @@ app.use(cors({
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(cookieParser());
 
 // Serve uploaded files
@@ -36,12 +39,17 @@ const UPLOADS_DIR = path.join(process.cwd(), 'uploads');
 if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 app.use('/uploads', express.static(UPLOADS_DIR));
 
+// Ensure private-uploads directory exists (never served via static)
+const PRIVATE_UPLOADS_DIR = path.join(process.cwd(), 'private-uploads');
+if (!fs.existsSync(PRIVATE_UPLOADS_DIR)) fs.mkdirSync(PRIVATE_UPLOADS_DIR, { recursive: true });
+
 // ── API Routes ───────────────────────────────────────────────
 app.use('/api/auth', authRoutes);
 app.use('/api/classes', classRoutes);
 app.use('/api/exercises', exerciseRoutes);
 app.use('/api/documents', documentRoutes);
 app.use('/api/meetings', meetingRoutes);
+app.use('/api', examRoutes);
 
 // Health check
 app.get('/api/health', (_req, res) => {
@@ -66,13 +74,16 @@ if (sslKeyPath && sslCertPath && fs.existsSync(sslKeyPath) && fs.existsSync(sslC
   console.log('⚠️  Running with HTTP (no SSL certs found)');
 }
 
-// ── Socket.IO (WebRTC signaling) ─────────────────────────────
+// ── Socket.IO (WebRTC signaling + Proctoring monitor) ─────────
 const io = new SocketIOServer(server, {
   cors: {
     origin: [FRONTEND_URL, 'https://localhost:5173'],
     credentials: true,
   },
 });
+
+// Register proctoring monitor namespace
+registerMonitorNamespace(io);
 
 // Track participants per room: roomId → Map<socketId, { userId, userName }>
 const rooms = new Map<string, Map<string, { userId: string; userName: string }>>();
@@ -100,47 +111,50 @@ io.on('connection', (socket) => {
     if (!rooms.has(roomId)) rooms.set(roomId, new Map());
     rooms.get(roomId)!.set(socket.id, { userId, userName });
 
-    // Notify existing peers about the new user (send socket.id so they can create peer connections)
-    socket.to(roomId).emit('user-connected', socket.id, userName);
-
-    // Send full participant list to everyone in the room
-    io.to(roomId).emit('room-participants', getRoomParticipants(roomId));
-
     console.log(`User ${userName} (${socket.id}) joined room ${roomId}`);
 
-    // WebRTC signaling — all routing via socket.id
-    socket.on('offer', (targetSocketId: string, offer: unknown) => {
-      socket.to(targetSocketId).emit('offer', socket.id, offer);
-    });
+    // Notify others in room: new user joined
+    socket.to(roomId).emit('user-joined', { socketId: socket.id, userId, userName });
 
-    socket.on('answer', (targetSocketId: string, answer: unknown) => {
-      socket.to(targetSocketId).emit('answer', socket.id, answer);
-    });
+    // Send existing participants list back to the newly joined user
+    socket.emit('room-participants', getRoomParticipants(roomId));
+  });
 
-    socket.on('candidate', (targetSocketId: string, candidate: unknown) => {
-      socket.to(targetSocketId).emit('candidate', socket.id, candidate);
-    });
+  socket.on('leave-room', (roomId: string) => {
+    if (rooms.has(roomId)) {
+      rooms.get(roomId)!.delete(socket.id);
+      if (rooms.get(roomId)!.size === 0) rooms.delete(roomId);
+    }
+    socket.to(roomId).emit('user-left', socket.id);
+    socket.leave(roomId);
+    console.log(`User left room: ${roomId}`);
+  });
 
-    socket.on('disconnect', () => {
-      if (joinedRoomId) {
-        const room = rooms.get(joinedRoomId);
-        if (room) {
-          room.delete(socket.id);
-          if (room.size === 0) rooms.delete(joinedRoomId);
-        }
-        socket.to(joinedRoomId).emit('user-disconnected', socket.id);
-        io.to(joinedRoomId).emit('room-participants', getRoomParticipants(joinedRoomId));
-        console.log(`Socket ${socket.id} disconnected from room ${joinedRoomId}`);
+  // Relay WebRTC signaling offer/answer/ICE candidate
+  socket.on('signal', ({ to, data }: { to: string; data: unknown }) => {
+    io.to(to).emit('signal', { from: socket.id, data });
+  });
+
+  socket.on('disconnect', () => {
+    if (joinedRoomId && rooms.has(joinedRoomId)) {
+      rooms.get(joinedRoomId)!.delete(socket.id);
+      if (rooms.get(joinedRoomId)!.size === 0) {
+        rooms.delete(joinedRoomId);
       }
-    });
+      socket.to(joinedRoomId).emit('user-disconnected', socket.id);
+      io.to(joinedRoomId).emit('room-participants', getRoomParticipants(joinedRoomId));
+      console.log(`Socket ${socket.id} disconnected from room ${joinedRoomId}`);
+    }
   });
 });
-
 
 // ── Start ────────────────────────────────────────────────────
 async function start() {
   try {
     await testConnection();
+    // Start background proctoring jobs (auto submit & evidence cleanup)
+    startProctoringJobs();
+
     server.listen(PORT, () => {
       const ip = getWifiIP();
       const proto = sslKeyPath ? 'https' : 'http';

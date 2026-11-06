@@ -1,4 +1,4 @@
-import { Pool, PoolConfig } from 'pg';
+import { Pool, PoolClient, PoolConfig, QueryResult, QueryResultRow } from 'pg';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -21,7 +21,12 @@ pool.on('error', (err) => {
   process.exit(-1);
 });
 
-export async function query<T = Record<string, unknown>>(
+/** Interface with .query(): compatible with both Pool and PoolClient */
+export interface Db {
+  query<R extends QueryResultRow = any>(text: string, params?: any[]): Promise<QueryResult<R>>;
+}
+
+export async function query<T = any>(
   text: string,
   params?: unknown[]
 ): Promise<T[]> {
@@ -34,12 +39,28 @@ export async function query<T = Record<string, unknown>>(
   }
 }
 
-export async function queryOne<T = Record<string, unknown>>(
+export async function queryOne<T = any>(
   text: string,
   params?: unknown[]
 ): Promise<T | null> {
   const rows = await query<T>(text, params);
   return rows[0] ?? null;
+}
+
+/** Runs fn within a transaction. Rolls back on error, commits on success. */
+export async function withTransaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (err) {
+    await client.query('ROLLBACK');
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 export async function testConnection(): Promise<void> {

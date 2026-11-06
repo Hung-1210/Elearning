@@ -2,6 +2,7 @@ import React, { useEffect, useState, useMemo } from 'react';
 import { documentApi, classApi } from '../../api';
 import type { ClassInfo, DocCategoryRaw } from '../../types';
 import Sidebar from '../../components/layout/Sidebar';
+import { useLayoutStore } from '../../store/layoutStore';
 
 interface DocItem {
   id: number;
@@ -185,11 +186,12 @@ export default function DocumentsPage() {
   }, [categories, search]);
 
   const totalDocs = categories.reduce((sum, c) => sum + c.docs.length, 0);
+  const { sidebarCollapsed } = useLayoutStore();
 
   return (
     <div className="app-layout">
       <Sidebar classes={classes} />
-      <div className="main-content">
+      <div className={`main-content ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
         {/* Header */}
         <header className="page-header">
           <div className="page-header-left">

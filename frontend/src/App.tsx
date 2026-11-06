@@ -1,14 +1,35 @@
-import React, { useEffect } from 'react';
+import React, { Suspense, lazy, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useParams, useNavigate } from 'react-router-dom';
 import { useAuthStore } from './store/authStore';
 import { classApi } from './api';
 
-// Pages
+// Pages (code-split by route to keep initial bundle small)
 import LoginPage from './pages/auth/LoginPage';
-import DashboardPage from './pages/dashboard/DashboardPage';
-import ClassPage from './pages/class/ClassPage';
-import MeetingRoom from './pages/meeting/MeetingRoom';
-import DocumentsPage from './pages/documents/DocumentsPage';
+const DashboardPage = lazy(() => import('./pages/dashboard/DashboardPage'));
+const ClassPage = lazy(() => import('./pages/class/ClassPage'));
+const MeetingRoom = lazy(() => import('./pages/meeting/MeetingRoom'));
+const DocumentsPage = lazy(() => import('./pages/documents/DocumentsPage'));
+const CreateExamWizard = lazy(() =>
+  import('./pages/exam/CreateExamWizard').then((m) => ({ default: m.CreateExamWizard })),
+);
+const LiveMonitorPage = lazy(() =>
+  import('./pages/exam/LiveMonitorPage').then((m) => ({ default: m.LiveMonitorPage })),
+);
+const GradingResultsPage = lazy(() =>
+  import('./pages/exam/GradingResultsPage').then((m) => ({ default: m.GradingResultsPage })),
+);
+const ExamViolationsPage = lazy(() =>
+  import('./pages/exam/ExamViolationsPage').then((m) => ({ default: m.ExamViolationsPage })),
+);
+const PrecheckRoomPage = lazy(() =>
+  import('./pages/exam/PrecheckRoomPage').then((m) => ({ default: m.PrecheckRoomPage })),
+);
+const ExamTakingPage = lazy(() =>
+  import('./pages/exam/ExamTakingPage').then((m) => ({ default: m.ExamTakingPage })),
+);
+const ExamResultPage = lazy(() =>
+  import('./pages/exam/ExamResultPage').then((m) => ({ default: m.ExamResultPage })),
+);
 
 // Protected route wrapper
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -87,7 +108,8 @@ export default function App() {
 
   return (
     <BrowserRouter>
-      <Routes>
+      <Suspense fallback={<LoadingScreen />}>
+        <Routes>
         {/* Public */}
         <Route path="/login" element={<AuthRoute><LoginPage /></AuthRoute>} />
 
@@ -98,9 +120,19 @@ export default function App() {
         <Route path="/class/:classId/meet/:meetingCode" element={<ProtectedRoute><MeetingRoom /></ProtectedRoute>} />
         <Route path="/join/:inviteCode" element={<ProtectedRoute><JoinClassRedirect /></ProtectedRoute>} />
 
-        {/* Fallback */}
-        <Route path="*" element={<Navigate to="/" replace />} />
-      </Routes>
+        {/* Exam Module Routes */}
+        <Route path="/class/:classId/exam/create" element={<ProtectedRoute><CreateExamWizard /></ProtectedRoute>} />
+        <Route path="/exam/:examId/monitor" element={<ProtectedRoute><LiveMonitorPage /></ProtectedRoute>} />
+        <Route path="/exam/:examId/grading" element={<ProtectedRoute><GradingResultsPage /></ProtectedRoute>} />
+        <Route path="/exam/:examId/violations" element={<ProtectedRoute><ExamViolationsPage /></ProtectedRoute>} />
+        <Route path="/exam/:examId/precheck" element={<ProtectedRoute><PrecheckRoomPage /></ProtectedRoute>} />
+        <Route path="/exam/:examId/take/:attemptId" element={<ProtectedRoute><ExamTakingPage /></ProtectedRoute>} />
+        <Route path="/exam/:examId/result/:attemptId" element={<ProtectedRoute><ExamResultPage /></ProtectedRoute>} />
+
+          {/* Fallback */}
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </Suspense>
     </BrowserRouter>
   );
 }

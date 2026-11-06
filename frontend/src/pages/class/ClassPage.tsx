@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useMemo, useRef } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import { classApi, exerciseApi, meetingApi, documentApi } from '../../api';
 import { useAuthStore } from '../../store/authStore';
 import type {
@@ -12,8 +12,10 @@ import type {
   SubmittedFile,
 } from '../../types';
 import Sidebar from '../../components/layout/Sidebar';
+import { useLayoutStore } from '../../store/layoutStore';
+import { QuestionBankTab, TeacherExamListTab, StudentExamListTab } from '../exam';
 
-type Tab = 'overview' | 'exercises' | 'meetings' | 'students' | 'documents';
+type Tab = 'overview' | 'exercises' | 'meetings' | 'students' | 'documents' | 'exams' | 'question-bank';
 
 interface CategoryGroup {
   id: number;
@@ -27,10 +29,20 @@ export default function ClassPage() {
   const { id } = useParams<{ id: string }>();
   const classId = parseInt(id || '0', 10);
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
   const { user } = useAuthStore();
+  const { sidebarCollapsed } = useLayoutStore();
   const isLecturer = user?.isLecturer;
 
-  const [activeTab, setActiveTab] = useState<Tab>('overview');
+  const initialTab = (searchParams.get('tab') as Tab) || 'overview';
+  const [activeTab, setActiveTab] = useState<Tab>(initialTab);
+
+  useEffect(() => {
+    const tabParam = searchParams.get('tab') as Tab;
+    if (tabParam && tabParam !== activeTab) {
+      setActiveTab(tabParam);
+    }
+  }, [searchParams]);
   const [allClasses, setAllClasses] = useState<ClassInfo[]>([]);
   const [classInfo, setClassInfo] = useState<ClassInfo | null>(null);
   const [exercises, setExercises] = useState<Exercise[]>([]);
@@ -562,7 +574,7 @@ export default function ClassPage() {
     return (
       <div className="app-layout">
         <Sidebar classes={allClasses} currentClassId={classId} />
-        <div className="main-content page-loading"><div className="spinner" /></div>
+        <div className={`main-content page-loading ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}><div className="spinner" /></div>
       </div>
     );
   }
@@ -573,12 +585,14 @@ export default function ClassPage() {
     { key: 'meetings', label: 'Buổi học', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg> },
     ...(isLecturer ? [{ key: 'students' as Tab, label: 'Học viên', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg> }] : []),
     { key: 'documents', label: 'Tài liệu lớp', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg> },
+    { key: 'exams', label: '📝 Đề thi', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> },
+    ...(isLecturer ? [{ key: 'question-bank' as Tab, label: '📚 Ngân hàng câu hỏi', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg> }] : []),
   ];
 
   return (
     <div className="app-layout">
       <Sidebar classes={allClasses} currentClassId={classId} />
-      <div className="main-content">
+      <div className={`main-content ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
         {/* Header */}
         <header className="page-header">
           <div className="page-header-left">
@@ -1116,6 +1130,24 @@ export default function ClassPage() {
                   ))}
                 </div>
               )}
+            </div>
+          )}
+
+          {/* ── EXAMS TAB ───────────────────────────────────────────── */}
+          {activeTab === 'exams' && (
+            <div>
+              {isLecturer ? (
+                <TeacherExamListTab classId={String(classId)} />
+              ) : (
+                <StudentExamListTab classId={String(classId)} />
+              )}
+            </div>
+          )}
+
+          {/* ── QUESTION BANK TAB ───────────────────────────────────── */}
+          {activeTab === 'question-bank' && isLecturer && (
+            <div>
+              <QuestionBankTab classId={String(classId)} />
             </div>
           )}
         </main>

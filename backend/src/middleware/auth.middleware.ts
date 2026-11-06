@@ -1,4 +1,5 @@
 import jwt from 'jsonwebtoken';
+import { randomUUID } from 'crypto';
 import { Request, Response, NextFunction } from 'express';
 import { AuthPayload } from '../models/types.js';
 
@@ -20,6 +21,7 @@ export function generateAccessToken(payload: AuthPayload): string {
 export function generateRefreshToken(payload: AuthPayload): string {
   return jwt.sign(payload, process.env.JWT_REFRESH_SECRET as string, {
     expiresIn: (process.env.JWT_REFRESH_EXPIRES_IN || '7d') as jwt.SignOptions['expiresIn'],
+    jwtid: randomUUID(),
   });
 }
 

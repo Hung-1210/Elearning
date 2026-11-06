@@ -4,6 +4,7 @@ import { classApi } from '../../api';
 import { useAuthStore } from '../../store/authStore';
 import type { ClassInfo } from '../../types';
 import Sidebar from '../../components/layout/Sidebar';
+import { useLayoutStore } from '../../store/layoutStore';
 
 const CLASS_COLORS = [
   '#4F46E5', '#7C3AED', '#2563EB', '#0891B2',
@@ -52,11 +53,12 @@ export default function DashboardPage() {
   };
 
   const totalMembers = classes.reduce((s, c) => s + (c.member_count || 0), 0);
+  const { sidebarCollapsed } = useLayoutStore();
 
   return (
     <div className="app-layout">
       <Sidebar classes={classes} />
-      <div className="main-content">
+      <div className={`main-content ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
         {/* Header */}
         <header className="page-header">
           <div className="page-header-left">
