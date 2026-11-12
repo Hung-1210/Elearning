@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   FiArrowLeft,
   FiSearch,
@@ -15,11 +15,13 @@ import {
   FiClock,
   FiAward,
   FiActivity,
+  FiDownload,
 } from 'react-icons/fi';
 import { examApi, classApi } from '../../api';
 import type { ClassInfo } from '../../types';
 import Sidebar from '../../components/layout/Sidebar';
 import { useLayoutStore } from '../../store/layoutStore';
+import { extractAnswerFileName, formatSubmitReason, triggerBlobDownload } from './examUtils';
 import './exam.css';
 
 interface GradingExamMeta {
@@ -84,6 +86,8 @@ interface GradeAuditItem {
 export const GradingResultsPage: React.FC = () => {
   const { examId } = useParams<{ examId: string }>();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const queryAttemptId = searchParams.get('attemptId');
   const { sidebarCollapsed } = useLayoutStore();
 
   const [allClasses, setAllClasses] = useState<ClassInfo[]>([]);
@@ -98,7 +102,18 @@ export const GradingResultsPage: React.FC = () => {
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'pending' | 'graded'>('all');
   const [savingGrade, setSavingGrade] = useState(false);
-  const [saveBanner, setSaveBanner] = useState<string | null>(null);
+  const [exportingFormat, setExportingFormat] = useState<'xlsx' | 'csv' | null>(null);
+  const [saveBanner, setSaveBanner] = useState<{
+    text: string;
+    tone: 'success' | 'error';
+  } | null>(null);
+
+  const showBanner = useCallback((text: string, tone: 'success' | 'error' = 'success') => {
+    setSaveBanner({ text, tone });
+    window.setTimeout(() => {
+      setSaveBanner((cur) => (cur?.text === text ? null : cur));
+    }, 4000);
+  }, []);
 
   useEffect(() => {
     classApi.getAll().then((res) => setAllClasses(res.data.data || [])).catch(() => {});
@@ -155,8 +170,8 @@ export const GradingResultsPage: React.FC = () => {
   );
 
   useEffect(() => {
-    void loadSubmissions(null);
-  }, [loadSubmissions]);
+    void loadSubmissions(queryAttemptId);
+  }, [loadSubmissions, queryAttemptId]);
 
   const handleSelectSubmission = (attId: string) => {
     setSelectedAttemptId(attId);
@@ -168,7 +183,10 @@ export const GradingResultsPage: React.FC = () => {
     for (let i = 0; i < answers.length; i += 1) {
       const ans = answers[i];
       if (!Number.isFinite(ans.earned_points) || ans.earned_points < 0 || ans.earned_points > ans.max_points) {
-        alert(`Điểm Câu ${i + 1} phải nằm trong khoảng 0 đến ${ans.max_points} điểm.`);
+        showBanner(
+          `Điểm Câu ${i + 1} phải nằm trong khoảng 0 đến ${ans.max_points} điểm.`,
+          'error',
+        );
         return;
       }
     }
@@ -181,13 +199,36 @@ export const GradingResultsPage: React.FC = () => {
           feedback: a.teacher_feedback,
         })),
       });
-      setSaveBanner('Đã lưu điểm chấm bài và ghi nhật ký kiểm toán thành công.');
-      window.setTimeout(() => setSaveBanner(null), 3500);
+      showBanner('Đã lưu điểm chấm bài và ghi nhật ký kiểm toán thành công.', 'success');
       await loadSubmissions(selectedAttemptId);
     } catch (err: any) {
-      alert(err.response?.data?.error || err.response?.data?.message || 'Không thể lưu điểm.');
+      showBanner(
+        err.response?.data?.error || err.response?.data?.message || 'Không thể lưu điểm.',
+        'error',
+      );
     } finally {
       setSavingGrade(false);
+    }
+  };
+
+  const handleExportGrading = async (format: 'xlsx' | 'csv') => {
+    if (!examId || exportingFormat) return;
+    setExportingFormat(format);
+    try {
+      const res = await examApi.exportGradingFile(examId, format);
+      triggerBlobDownload(
+        res.data,
+        `bang-diem-exam-${examId}.${format}`,
+        res.headers?.['content-disposition'],
+      );
+      showBanner(
+        `Đã xuất bảng điểm định dạng ${format.toUpperCase()} thành công.`,
+        'success',
+      );
+    } catch {
+      showBanner('Không thể xuất tệp bảng điểm. Vui lòng thử lại.', 'error');
+    } finally {
+      setExportingFormat(null);
     }
   };
 
@@ -235,6 +276,17 @@ export const GradingResultsPage: React.FC = () => {
   );
   const liveTotalScore = Math.round((liveObjectiveScore + liveManualScore) * 100) / 100;
 
+  const handleDownloadAnswerFile = async (questionId: string, filePath?: string | null) => {
+    if (!selectedAttemptId || !filePath) return;
+    try {
+      const res = await examApi.downloadAnswerFile(selectedAttemptId, questionId);
+      const disposition = (res.headers as Record<string, string | undefined>)?.['content-disposition'];
+      triggerBlobDownload(res.data, extractAnswerFileName(filePath) || `bai-nop-cau-${questionId}`, disposition);
+    } catch (err: any) {
+      showBanner(err.response?.data?.error || 'Không thể tải xuống tệp đính kèm của sinh viên.', 'error');
+    }
+  };
+
   return (
     <div className="exam-layout-wrapper">
       <Sidebar classes={allClasses} currentClassId={examMeta?.class_id ? Number(examMeta.class_id) : undefined} />
@@ -271,9 +323,18 @@ export const GradingResultsPage: React.FC = () => {
 
         <div className="exam-page-content" style={{ maxWidth: '100%' }}>
           {saveBanner && (
-            <div className="monitor-toast-banner">
-              <FiCheckCircle size={16} />
-              <span>{saveBanner}</span>
+            <div
+              className={
+                saveBanner.tone === 'error' ? 'exam-error-banner' : 'monitor-toast-banner'
+              }
+              role="status"
+            >
+              {saveBanner.tone === 'error' ? (
+                <FiAlertTriangle size={16} />
+              ) : (
+                <FiCheckCircle size={16} />
+              )}
+              <span>{saveBanner.text}</span>
             </div>
           )}
 
@@ -288,7 +349,25 @@ export const GradingResultsPage: React.FC = () => {
               </div>
             </div>
 
-            <div className="grading-top-actions">
+            <div className="grading-top-actions" style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+              <button
+                type="button"
+                className="exam-btn exam-btn-outline"
+                disabled={Boolean(exportingFormat) || submissions.length === 0}
+                onClick={() => void handleExportGrading('csv')}
+              >
+                <FiDownload size={15} />{' '}
+                {exportingFormat === 'csv' ? 'Đang xuất...' : 'Xuất CSV'}
+              </button>
+              <button
+                type="button"
+                className="exam-btn exam-btn-secondary"
+                disabled={Boolean(exportingFormat) || submissions.length === 0}
+                onClick={() => void handleExportGrading('xlsx')}
+              >
+                <FiDownload size={15} />{' '}
+                {exportingFormat === 'xlsx' ? 'Đang xuất...' : 'Xuất Excel (.xlsx)'}
+              </button>
               <button
                 type="button"
                 className="exam-btn exam-btn-primary"
@@ -481,8 +560,8 @@ export const GradingResultsPage: React.FC = () => {
                           {selectedSubmission.submitted_at
                             ? new Date(selectedSubmission.submitted_at).toLocaleString('vi-VN')
                             : '--'}
-                          {selectedSubmission.submit_reason && selectedSubmission.submit_reason !== 'manual' && (
-                            <> • Hình thức nộp: <strong>{selectedSubmission.submit_reason}</strong></>
+                          {selectedSubmission.submit_reason && (
+                            <> • Hình thức nộp: <strong>{formatSubmitReason(selectedSubmission.submit_reason)}</strong></>
                           )}
                         </p>
                       </div>
@@ -508,7 +587,11 @@ export const GradingResultsPage: React.FC = () => {
                         <button
                           type="button"
                           className="exam-btn exam-btn-danger"
-                          onClick={() => navigate(`/exam/${examId}/violations`)}
+                          onClick={() =>
+                            navigate(
+                              `/exam/${examId}/violations?attemptId=${selectedSubmission.attempt_id}`,
+                            )
+                          }
                         >
                           <FiShield size={15} /> {selectedSubmission.violations_count} cảnh báo AI
                         </button>
@@ -608,27 +691,48 @@ export const GradingResultsPage: React.FC = () => {
                           {/* Essay / File / Code Answer Preview */}
                           {!isObjective && (
                             <div className="g-essay-block">
-                              <label className="block-label">
-                                {ans.type === 'code' ? (
-                                  <>
-                                    <FiCode /> Bài lập trình của sinh viên:
-                                  </>
-                                ) : (
-                                  <>
-                                    <FiFileText /> Nội dung trả lời của sinh viên:
-                                  </>
+                              <div
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'space-between',
+                                  gap: 10,
+                                  flexWrap: 'wrap',
+                                  marginBottom: 6,
+                                }}
+                              >
+                                <label className="block-label" style={{ marginBottom: 0 }}>
+                                  {ans.type === 'code' || ans.type === 'file_upload' ? (
+                                    <>
+                                      <FiCode /> Bài nộp mã nguồn / tệp của sinh viên:
+                                    </>
+                                  ) : (
+                                    <>
+                                      <FiFileText /> Nội dung trả lời của sinh viên:
+                                    </>
+                                  )}
+                                </label>
+                                {ans.file_path && (
+                                  <button
+                                    type="button"
+                                    className="exam-btn exam-btn-outline"
+                                    style={{ padding: '5px 12px', fontSize: 12 }}
+                                    onClick={() => void handleDownloadAnswerFile(ans.question_id, ans.file_path)}
+                                  >
+                                    <FiDownload size={13} /> Tải tệp đính kèm ({extractAnswerFileName(ans.file_path)})
+                                  </button>
                                 )}
-                              </label>
+                              </div>
                               <div
                                 className={`student-submission-box ${
-                                  ans.type === 'code' ? 'code-font' : ''
+                                  ans.type === 'code' || ans.type === 'file_upload' ? 'code-font' : ''
                                 }`}
                               >
                                 <pre>
                                   {ans.student_answer_text?.trim()
                                     ? ans.student_answer_text
                                     : ans.file_path
-                                      ? `Tệp đính kèm: ${ans.file_path}`
+                                      ? `[Đã nộp tệp đính kèm: ${extractAnswerFileName(ans.file_path)}]`
                                       : '(Sinh viên bỏ trống câu hỏi này)'}
                                 </pre>
                               </div>

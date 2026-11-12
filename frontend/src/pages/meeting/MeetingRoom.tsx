@@ -1,6 +1,11 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback, type CSSProperties } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { io, Socket } from 'socket.io-client';
+import {
+  FiMic, FiMicOff, FiVideo, FiVideoOff, FiMonitor, FiMessageSquare,
+  FiUsers, FiPhoneOff, FiX, FiSend, FiCopy, FiCheck,
+} from 'react-icons/fi';
+import { MdOutlinePanTool, MdPanTool, MdPushPin, MdOutlinePushPin } from 'react-icons/md';
 import { useAuthStore } from '../../store/authStore';
 
 const SOCKET_URL = import.meta.env.VITE_API_URL?.replace('/api', '') || 'http://localhost:3001';
@@ -21,7 +26,7 @@ interface ChatMessage {
 }
 
 interface DataChannelMessage {
-  type: 'MESSAGE' | 'CAMERA_OFF' | 'CAMERA_ON' | 'SCREEN_SHARING_STARTED' | 'SCREEN_SHARING_STOPPED' | 'RISE_HAND' | 'LOWER_HAND';
+  type: 'MESSAGE' | 'CAMERA_OFF' | 'CAMERA_ON' | 'MIC_OFF' | 'MIC_ON' | 'SCREEN_SHARING_STARTED' | 'SCREEN_SHARING_STOPPED' | 'RISE_HAND' | 'LOWER_HAND';
   sender?: string;
   message?: string;
 }
@@ -93,6 +98,39 @@ export default function MeetingRoom() {
   const [showParticipants, setShowParticipants] = useState(false);
   const [peerCamOff, setPeerCamOff] = useState<Set<string>>(new Set());
   const [pinnedPeer, setPinnedPeer] = useState<string | null>(null);
+  const [peerSharing, setPeerSharing] = useState<Set<string>>(new Set());
+  const [peerMicOff, setPeerMicOff] = useState<Set<string>>(new Set());
+  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+  const [clock, setClock] = useState(() => new Date());
+  const [copied, setCopied] = useState(false);
+  const stageRef = useRef<HTMLDivElement>(null);
+  const [stageSize, setStageSize] = useState({ w: 0, h: 0 });
+  const micOnRef = useRef(true);
+  useEffect(() => { micOnRef.current = micOn; }, [micOn]);
+  useEffect(() => {
+    const t = setInterval(() => setClock(new Date()), 15000);
+    return () => clearInterval(t);
+  }, []);
+  const [unreadChat, setUnreadChat] = useState(0);
+
+  // Refs phản chiếu state để dùng trong callback bất đồng bộ (tránh stale closure)
+  const camOnRef = useRef(true);
+  const handRaisedRef = useRef(false);
+  const chatOpenRef = useRef(false);
+  const pendingCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
+  useEffect(() => { camOnRef.current = camOn; }, [camOn]);
+  useEffect(() => { handRaisedRef.current = handRaised; }, [handRaised]);
+  useEffect(() => { chatOpenRef.current = chatOpen; if (chatOpen) setUnreadChat(0); }, [chatOpen]);
+
+  const flushPendingCandidates = async (peerId: string, pc: RTCPeerConnection) => {
+    const queued = pendingCandidatesRef.current.get(peerId);
+    if (!queued?.length) return;
+    pendingCandidatesRef.current.delete(peerId);
+    for (const c of queued) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(c)); }
+      catch (err) { console.error('flush addIceCandidate failed:', err); }
+    }
+  };
 
   // ── Broadcast Data via DataChannels ────────────────────────
   const broadcastData = useCallback((data: DataChannelMessage) => {
@@ -122,10 +160,18 @@ export default function MeetingRoom() {
       case 'CAMERA_ON':
         setPeerCamOff(prev => { const s = new Set(prev); s.delete(peerId); return s; });
         break;
+      case 'MIC_OFF':
+        setPeerMicOff(prev => new Set(prev).add(peerId));
+        break;
+      case 'MIC_ON':
+        setPeerMicOff(prev => { const s = new Set(prev); s.delete(peerId); return s; });
+        break;
       case 'SCREEN_SHARING_STARTED':
+        setPeerSharing(prev => new Set(prev).add(peerId));
         setPinnedPeer(peerId);
         break;
       case 'SCREEN_SHARING_STOPPED':
+        setPeerSharing(prev => { const s = new Set(prev); s.delete(peerId); return s; });
         setPinnedPeer(prev => prev === peerId ? null : prev);
         break;
       case 'RISE_HAND':
@@ -153,16 +199,21 @@ export default function MeetingRoom() {
     stream.getTracks().forEach(t => pc.addTrack(t, stream));
 
     // DataChannel setup
-    if (isInitiator) {
-      const dc = pc.createDataChannel('data-channel');
+    const setupDataChannel = (dc: RTCDataChannel) => {
       dataChannelsRef.current.set(peerId, dc);
       dc.onmessage = (e) => handleDataChannelMessage(peerId, e);
-    } else {
-      pc.ondatachannel = (e) => {
-        const dc = e.channel;
-        dataChannelsRef.current.set(peerId, dc);
-        dc.onmessage = (ev) => handleDataChannelMessage(peerId, ev);
+      // Khi kênh mở, gửi trạng thái hiện tại để người kia hiển thị đúng ngay
+      dc.onopen = () => {
+        if (!camOnRef.current) dc.send(JSON.stringify({ type: 'CAMERA_OFF' }));
+        if (!micOnRef.current) dc.send(JSON.stringify({ type: 'MIC_OFF' }));
+        if (handRaisedRef.current) dc.send(JSON.stringify({ type: 'RISE_HAND' }));
+        if (screenStreamRef.current) dc.send(JSON.stringify({ type: 'SCREEN_SHARING_STARTED' }));
       };
+    };
+    if (isInitiator) {
+      setupDataChannel(pc.createDataChannel('data-channel'));
+    } else {
+      pc.ondatachannel = (e) => setupDataChannel(e.channel);
     }
 
     // ICE candidates
@@ -170,11 +221,12 @@ export default function MeetingRoom() {
       if (e.candidate) sock.emit('candidate', peerId, e.candidate);
     };
 
-    // Remote tracks
+    // Remote tracks (audio + video cùng một stream)
     pc.ontrack = (e) => {
+      const remote = e.streams[0] ?? new MediaStream([e.track]);
       setPeerStreams(prev => {
         const m = new Map(prev);
-        m.set(peerId, e.streams[0]);
+        m.set(peerId, remote);
         return m;
       });
     };
@@ -242,6 +294,7 @@ export default function MeetingRoom() {
       if (!mounted) { stream.getTracks().forEach(t => t.stop()); return; }
 
       localStreamRef.current = stream;
+      setLocalStream(stream);
       setCamOn(hasRealVideo);
       setMicOn(hasRealAudio);
       if (localVideoRef.current) localVideoRef.current.srcObject = stream;
@@ -280,31 +333,58 @@ export default function MeetingRoom() {
       // Received offer — we are the answerer
       sock.on('offer', async (fromSocketId: string, offer: RTCSessionDescriptionInit) => {
         if (!mounted || !localStreamRef.current) return;
-        const pc = createPeer(fromSocketId, sock, localStreamRef.current!, false);
-        await pc.setRemoteDescription(new RTCSessionDescription(offer));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        sock.emit('answer', fromSocketId, answer);
+        try {
+          const pc = createPeer(fromSocketId, sock, localStreamRef.current!, false);
+          await pc.setRemoteDescription(new RTCSessionDescription(offer));
+          await flushPendingCandidates(fromSocketId, pc);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          sock.emit('answer', fromSocketId, answer);
+        } catch (err) {
+          console.error('Handle offer failed:', err);
+        }
       });
 
       // Received answer
       sock.on('answer', async (fromSocketId: string, answer: RTCSessionDescriptionInit) => {
         if (!mounted) return;
         const pc = peersRef.current.get(fromSocketId);
-        if (pc) await pc.setRemoteDescription(new RTCSessionDescription(answer));
+        if (!pc) return;
+        try {
+          await pc.setRemoteDescription(new RTCSessionDescription(answer));
+          await flushPendingCandidates(fromSocketId, pc);
+        } catch (err) {
+          console.error('Handle answer failed:', err);
+        }
       });
 
-      // ICE candidate
+      // ICE candidate (có thể đến trước khi remoteDescription được set → xếp hàng)
       sock.on('candidate', async (fromSocketId: string, candidate: RTCIceCandidateInit) => {
         if (!mounted) return;
         const pc = peersRef.current.get(fromSocketId);
-        if (pc) {
-          try {
-            await pc.addIceCandidate(new RTCIceCandidate(candidate));
-          } catch (err) {
-            console.error('addIceCandidate failed:', err);
-          }
+        if (!pc || !pc.remoteDescription) {
+          const q = pendingCandidatesRef.current.get(fromSocketId) ?? [];
+          q.push(candidate);
+          pendingCandidatesRef.current.set(fromSocketId, q);
+          return;
         }
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.error('addIceCandidate failed:', err);
+        }
+      });
+
+      // Chat qua socket (không phụ thuộc DataChannel)
+      sock.on('chat-message', (m: { sender: string; text: string; timestamp: number }) => {
+        if (!mounted) return;
+        setChatMessages(prev => [...prev, {
+          sender: m.sender,
+          text: m.text,
+          isOwn: false,
+          timestamp: m.timestamp || Date.now(),
+        }]);
+        setUnreadChat(prev => (chatOpenRef.current ? 0 : prev + 1));
       });
 
       // Peer disconnected
@@ -313,8 +393,11 @@ export default function MeetingRoom() {
         peersRef.current.get(peerSocketId)?.close();
         peersRef.current.delete(peerSocketId);
         dataChannelsRef.current.delete(peerSocketId);
+        pendingCandidatesRef.current.delete(peerSocketId);
         setPeerStreams(prev => { const m = new Map(prev); m.delete(peerSocketId); return m; });
         setPeerCamOff(prev => { const s = new Set(prev); s.delete(peerSocketId); return s; });
+        setPeerSharing(prev => { const s = new Set(prev); s.delete(peerSocketId); return s; });
+        setPeerMicOff(prev => { const s = new Set(prev); s.delete(peerSocketId); return s; });
         setRaisedHands(prev => { const s = new Set(prev); s.delete(peerSocketId); return s; });
         setPinnedPeer(prev => prev === peerSocketId ? null : prev);
       });
@@ -348,6 +431,7 @@ export default function MeetingRoom() {
       // Has real mic — just toggle enabled
       audioTrack.enabled = !audioTrack.enabled;
       setMicOn(audioTrack.enabled);
+      broadcastData({ type: audioTrack.enabled ? 'MIC_ON' : 'MIC_OFF' });
     } else {
       // Currently placeholder or no audio → try to get real mic
       try {
@@ -358,6 +442,7 @@ export default function MeetingRoom() {
         stream.addTrack(newAudioTrack);
         replaceTrackInPeers(newAudioTrack, 'audio');
         setMicOn(true);
+        broadcastData({ type: 'MIC_ON' });
       } catch (err) {
         console.error('Cannot enable mic:', err);
       }
@@ -408,6 +493,8 @@ export default function MeetingRoom() {
 
         // Replace video track in all peers
         replaceTrackInPeers(screenTrack);
+        // Hiển thị màn hình đang chia sẻ ngay trên tile của mình
+        if (localVideoRef.current) localVideoRef.current.srcObject = screenStream;
         broadcastData({ type: 'SCREEN_SHARING_STARTED' });
         setScreenSharing(true);
       } catch (err) {
@@ -428,6 +515,7 @@ export default function MeetingRoom() {
       if (stream) {
         const videoTrack = stream.getVideoTracks()[0];
         if (videoTrack) replaceTrackInPeers(videoTrack);
+        if (localVideoRef.current) localVideoRef.current.srcObject = stream;
       }
 
       broadcastData({ type: 'SCREEN_SHARING_STOPPED' });
@@ -450,7 +538,7 @@ export default function MeetingRoom() {
     if (!text) return;
 
     const senderName = user?.name || 'Bạn';
-    broadcastData({ type: 'MESSAGE', sender: senderName, message: text });
+    socketRef.current?.emit('chat-message', text);
     setChatMessages(prev => [...prev, {
       sender: senderName,
       text,
@@ -468,507 +556,480 @@ export default function MeetingRoom() {
     navigate(`/class/${classId}`);
   };
 
-  // ── Build Video Tiles ──────────────────────────────────────
-  const peerEntries = Array.from(peerStreams.entries());
-  const totalVideos = peerEntries.length + 1;
+  // ── Đo kích thước vùng hiển thị để chia lưới vừa khít (không cuộn) ──
+  useEffect(() => {
+    const el = stageRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(([entry]) => {
+      setStageSize({ w: entry.contentRect.width, h: entry.contentRect.height });
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
-  // Sort: pinned first, then raised hands
-  const sortedPeerEntries = [...peerEntries].sort((a, b) => {
-    if (a[0] === pinnedPeer) return -1;
-    if (b[0] === pinnedPeer) return 1;
-    const aHand = raisedHands.has(a[0]) ? -1 : 0;
-    const bHand = raisedHands.has(b[0]) ? -1 : 0;
-    return aHand - bHand;
+  const copyMeetingLink = async () => {
+    try {
+      await navigator.clipboard.writeText(window.location.href);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 2000);
+    } catch { /* trình duyệt chặn clipboard */ }
+  };
+
+  // ── Dựng danh sách tile ────────────────────────────────────
+  const SELF_ID = '__self';
+  const selfName = user?.name || 'Bạn';
+  const selfStream = screenSharing ? screenStreamRef.current : localStream;
+
+  interface TileInfo {
+    id: string; name: string; stream: MediaStream | null; isSelf: boolean;
+    showVideo: boolean; micOff: boolean; handUp: boolean; presenting: boolean;
+  }
+
+  const peerTiles: TileInfo[] = Array.from(peerStreams.entries()).map(([id, stream]) => ({
+    id,
+    name: peerNames.get(id) || `User ${id.slice(0, 6)}`,
+    stream,
+    isSelf: false,
+    showVideo: !peerCamOff.has(id) || peerSharing.has(id),
+    micOff: peerMicOff.has(id),
+    handUp: raisedHands.has(id),
+    presenting: peerSharing.has(id),
+  }));
+  // Người giơ tay / đang trình bày lên trước
+  peerTiles.sort((a, b) => {
+    const wa = (a.presenting ? 2 : 0) + (a.handUp ? 1 : 0);
+    const wb = (b.presenting ? 2 : 0) + (b.handUp ? 1 : 0);
+    return wb - wa;
   });
+  const selfTile: TileInfo = {
+    id: SELF_ID, name: `${selfName} (Bạn)`, stream: selfStream, isSelf: true,
+    showVideo: camOn || screenSharing, micOff: !micOn, handUp: handRaised, presenting: screenSharing,
+  };
+  const allTiles: TileInfo[] = [...peerTiles, selfTile];
 
-  const gridClass = pinnedPeer
-    ? 'video-grid video-grid-pinned'
-    : `video-grid video-grid-${Math.min(totalVideos, 6)}`;
+  const mainId = pinnedPeer && allTiles.some(t => t.id === pinnedPeer)
+    ? pinnedPeer
+    : (screenSharing ? SELF_ID : null);
+  const presenter = allTiles.find(t => t.presenting);
+  const totalPeople = participants.length || allTiles.length;
+
+  // ── Tính lưới vừa khít cho chế độ lưới ─────────────────────
+  const GAP = 8;
+  const MAX_TILES = 16;
+  const RATIO = 16 / 9;
+  const overflowCount = Math.max(0, allTiles.length - MAX_TILES);
+  const visibleTiles = overflowCount > 0 ? allTiles.slice(0, MAX_TILES - 1).concat(
+    allTiles.some((t, i) => i >= MAX_TILES - 1 && t.isSelf) ? [selfTile] : [],
+  ) : allTiles;
+  const hiddenCount = allTiles.length - visibleTiles.length;
+  const slotCount = visibleTiles.length + (hiddenCount > 0 ? 1 : 0);
+
+  const computeGrid = (n: number, W: number, H: number) => {
+    let best = { cols: 1, tw: 0, th: 0 };
+    if (W <= 0 || H <= 0 || n <= 0) return best;
+    for (let cols = 1; cols <= n; cols++) {
+      const rows = Math.ceil(n / cols);
+      const cw = (W - GAP * (cols - 1)) / cols;
+      const ch = (H - GAP * (rows - 1)) / rows;
+      const tw = Math.min(cw, ch * RATIO);
+      if (tw > best.tw) best = { cols, tw, th: tw / RATIO };
+    }
+    return best;
+  };
+  const grid = computeGrid(slotCount, stageSize.w, stageSize.h);
+  const gridWidth = grid.cols * grid.tw + (grid.cols - 1) * GAP;
+
+  const renderTile = (t: TileInfo, style?: CSSProperties) => (
+    <VideoTile
+      key={t.id}
+      name={t.name}
+      stream={t.stream}
+      isSelf={t.isSelf}
+      showVideo={t.showVideo}
+      micOff={t.micOff}
+      handUp={t.handUp}
+      presenting={t.presenting}
+      pinned={mainId === t.id}
+      onTogglePin={() => setPinnedPeer(prev => (prev === t.id ? null : t.id))}
+      style={style}
+    />
+  );
+
+  const mainTile = mainId ? allTiles.find(t => t.id === mainId) : null;
+  const sideTiles = mainId ? allTiles.filter(t => t.id !== mainId) : [];
+  const panelOpen = chatOpen || showParticipants;
+  const timeLabel = clock.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
 
   return (
-    <div className="meeting-room">
-      {/* ── Video Grid ────────────────────────────────────── */}
-      <div className={gridClass}>
-        {/* Local video */}
-        <div className={`video-tile ${handRaised ? 'hand-raised' : ''} ${pinnedPeer === '__self' ? 'pinned' : ''}`} onDoubleClick={() => setPinnedPeer(prev => prev === '__self' ? null : '__self')}>
-          <video ref={localVideoRef} autoPlay muted playsInline />
-          {!camOn && (
-            <div className="video-placeholder">
-              <div className="video-avatar">{user?.name?.[0]?.toUpperCase() || '?'}</div>
+    <div className="gm-root">
+      <div className="gm-body">
+        {/* ── Vùng hiển thị video ──────────────────────────── */}
+        <div className="gm-stage" ref={stageRef}>
+          {presenter && (
+            <div className="gm-present-chip">
+              {presenter.isSelf ? 'Bạn đang trình bày' : `${presenter.name} đang trình bày`}
             </div>
           )}
-          <div className="video-tile-label">
-            <span>{user?.name || 'Bạn'} (Bạn)</span>
-            {!micOn && <span className="mic-off-icon">🔇</span>}
-            {handRaised && <span className="hand-icon">✋</span>}
-          </div>
-          {screenSharing && <div className="sharing-badge">Đang chia sẻ màn hình</div>}
-        </div>
 
-        {/* Remote videos */}
-        {sortedPeerEntries.map(([id, stream]) => (
-          <RemoteVideoTile
-            key={id}
-            peerId={id}
-            stream={stream}
-            name={peerNames.get(id) || `User ${id.slice(0, 6)}`}
-            camOff={peerCamOff.has(id)}
-            handUp={raisedHands.has(id)}
-            isPinned={pinnedPeer === id}
-            onTogglePin={() => setPinnedPeer(prev => prev === id ? null : id)}
-          />
-        ))}
-      </div>
-
-      {/* ── Chat Panel ────────────────────────────────────── */}
-      <div className={`chat-panel ${chatOpen ? 'open' : ''}`}>
-        <div className="chat-header">
-          <h3>💬 Tin nhắn trong cuộc họp</h3>
-          <button type="button" className="chat-close-btn" onClick={(e) => { e.stopPropagation(); setChatOpen(false); }}>✕</button>
-        </div>
-        <div className="chat-messages">
-          {chatMessages.length === 0 && (
-            <div className="chat-empty">
-              <span>💬</span>
-              <p>Chưa có tin nhắn nào</p>
-              <p className="chat-empty-sub">Gửi tin nhắn cho mọi người trong phòng</p>
-            </div>
-          )}
-          {chatMessages.map((msg, i) => (
-            <div key={i} className={`chat-msg ${msg.isOwn ? 'own' : 'other'}`}>
-              {!msg.isOwn && <div className="chat-msg-sender">{msg.sender}</div>}
-              <div className="chat-msg-text">{msg.text}</div>
-              <div className="chat-msg-time">{new Date(msg.timestamp).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })}</div>
-            </div>
-          ))}
-          <div ref={chatEndRef} />
-        </div>
-        <div className="chat-input-area">
-          <form onSubmit={(e) => { e.preventDefault(); sendChatMessage(); }}>
-            <input
-              ref={chatInputRef}
-              type="text"
-              placeholder="Nhập tin nhắn..."
-              autoComplete="off"
-            />
-            <button type="submit" className="chat-send-btn">
-              <svg viewBox="0 0 24 24" fill="currentColor" width="20" height="20"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" /></svg>
-            </button>
-          </form>
-        </div>
-      </div>
-
-      {/* ── Participants Panel ────────────────────────────── */}
-      {showParticipants && (
-        <div className="participants-drawer">
-          <div className="drawer-header">
-            <span>👥 Người tham gia ({participants.length})</span>
-            <button onClick={() => setShowParticipants(false)}>✕</button>
-          </div>
-          <div className="drawer-body">
-            {participants.map((p) => (
-              <div key={p.socketId} className="participant-item">
-                <div className="participant-avatar">{p.userName[0]?.toUpperCase() || '?'}</div>
-                <span>{p.userName}</span>
-                {p.socketId === socketRef.current?.id && <span className="you-badge">(Bạn)</span>}
-                {raisedHands.has(p.socketId) && <span className="hand-icon-small">✋</span>}
+          {mainTile ? (
+            <div className="gm-present-layout">
+              <div className="gm-present-main">{renderTile(mainTile, { width: '100%', height: '100%' })}</div>
+              <div className="gm-present-side">
+                {sideTiles.map(t => renderTile(t, { width: '100%', aspectRatio: '16 / 9' }))}
               </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* ── Control Dock ──────────────────────────────────── */}
-      <div className="control-dock">
-        <div className="meeting-info">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
-            <polygon points="23 7 16 12 23 17 23 7" /><rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
-          </svg>
-          <span>Phòng: {meetingCode?.slice(0, 8)}...</span>
-        </div>
-
-        <div className="control-buttons">
-          {/* Mic */}
-          <button className={`control-btn ${!micOn ? 'control-btn-off' : ''}`} onClick={toggleMic} title={micOn ? 'Tắt mic' : 'Bật mic'}>
-            {micOn
-              ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" /><path d="M19 10v2a7 7 0 0 1-14 0v-2" /><line x1="12" y1="19" x2="12" y2="23" /><line x1="8" y1="23" x2="16" y2="23" /></svg>
-              : <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="1" y1="1" x2="23" y2="23" /><path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" /><path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" /><line x1="12" y1="19" x2="12" y2="23" /><line x1="8" y1="23" x2="16" y2="23" /></svg>}
-            <span>{micOn ? 'Tắt mic' : 'Bật mic'}</span>
-          </button>
-
-          {/* Camera */}
-          <button className={`control-btn ${!camOn ? 'control-btn-off' : ''}`} onClick={toggleCam} disabled={screenSharing} title={camOn ? 'Tắt camera' : 'Bật camera'}>
-            {camOn
-              ? <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><polygon points="23 7 16 12 23 17 23 7" /><rect x="1" y="5" width="15" height="14" rx="2" ry="2" /></svg>
-              : <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" /><line x1="1" y1="1" x2="23" y2="23" /></svg>}
-            <span>{camOn ? 'Tắt camera' : 'Bật camera'}</span>
-          </button>
-
-          {/* Screen Share */}
-          <button className={`control-btn ${screenSharing ? 'control-btn-active' : ''}`} onClick={toggleScreenShare} title={screenSharing ? 'Dừng chia sẻ' : 'Chia sẻ màn hình'}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <rect x="2" y="3" width="20" height="14" rx="2" ry="2" /><line x1="8" y1="21" x2="16" y2="21" /><line x1="12" y1="17" x2="12" y2="21" />
-              {screenSharing && <><line x1="4" y1="5" x2="20" y2="15" /><line x1="20" y1="5" x2="4" y2="15" /></>}
-            </svg>
-            <span>{screenSharing ? 'Dừng chia sẻ' : 'Chia sẻ'}</span>
-          </button>
-
-          {/* Raise Hand */}
-          <button className={`control-btn ${handRaised ? 'control-btn-active' : ''}`} onClick={toggleHand} title={handRaised ? 'Hạ tay' : 'Giơ tay'}>
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M18 10V6a2 2 0 0 0-4 0v1M14 7V4a2 2 0 0 0-4 0v6M10 6V3a2 2 0 0 0-4 0v8" />
-              <path d="M18 10a2 2 0 0 1 4 0v5a8 8 0 0 1-8 8h-2c-2.5 0-4.5-1-6.2-2.8L3 17.5a2 2 0 0 1 2.8-2.8L8 17V5" />
-            </svg>
-            <span>{handRaised ? 'Hạ tay' : 'Giơ tay'}</span>
-          </button>
-
-          {/* Chat */}
-          <button className={`control-btn ${chatOpen ? 'control-btn-active' : ''}`} onClick={() => { setChatOpen(!chatOpen); setShowParticipants(false); }} title="Tin nhắn">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
-            </svg>
-            <span>Tin nhắn</span>
-          </button>
-
-          {/* Participants */}
-          <button className={`control-btn ${showParticipants ? 'control-btn-active' : ''}`} onClick={() => { setShowParticipants(!showParticipants); setChatOpen(false); }} title="Người tham gia">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" />
-            </svg>
-            <span>({participants.length})</span>
-          </button>
-
-          {/* Leave */}
-          <button className="control-btn control-btn-danger" onClick={leaveRoom} title="Rời phòng">
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><polyline points="16 17 21 12 16 7" /><line x1="21" y1="12" x2="9" y2="12" />
-            </svg>
-            <span>Rời phòng</span>
-          </button>
+            </div>
+          ) : (
+            <div className="gm-grid" style={{ width: gridWidth > 0 ? gridWidth : '100%' }}>
+              {visibleTiles.map(t => renderTile(t, { width: grid.tw, height: grid.th }))}
+              {hiddenCount > 0 && (
+                <div className="gm-tile gm-more" style={{ width: grid.tw, height: grid.th }}>
+                  <div className="gm-more-avatar">+{hiddenCount}</div>
+                  <div className="gm-more-text">{hiddenCount} người khác</div>
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
-        <div style={{ minWidth: 120 }} />
+        {/* ── Panel bên phải (Chat / Người tham gia) ───────── */}
+        {panelOpen && (
+          <aside className="gm-panel">
+            <div className="gm-panel-header">
+              <h3>{chatOpen ? 'Tin nhắn trong cuộc họp' : 'Mọi người'}</h3>
+              <button type="button" className="gm-icon-btn-plain" onClick={() => { setChatOpen(false); setShowParticipants(false); }} aria-label="Đóng">
+                <FiX size={20} />
+              </button>
+            </div>
+
+            {chatOpen && (
+              <>
+                <div className="gm-chat-note">Tin nhắn chỉ hiển thị với người đang ở trong cuộc họp và sẽ mất khi bạn rời phòng.</div>
+                <div className="gm-chat-list">
+                  {chatMessages.length === 0 && (
+                    <div className="gm-chat-empty">Chưa có tin nhắn nào</div>
+                  )}
+                  {chatMessages.map((msg, i) => (
+                    <div key={i} className="gm-chat-item">
+                      <div className="gm-chat-meta">
+                        <strong>{msg.isOwn ? 'Bạn' : msg.sender}</strong>
+                        <span>{new Date(msg.timestamp).toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' })}</span>
+                      </div>
+                      <div className="gm-chat-text">{msg.text}</div>
+                    </div>
+                  ))}
+                  <div ref={chatEndRef} />
+                </div>
+                <form className="gm-chat-form" onSubmit={(e) => { e.preventDefault(); sendChatMessage(); }}>
+                  <input ref={chatInputRef} type="text" placeholder="Gửi tin nhắn" autoComplete="off" />
+                  <button type="submit" className="gm-chat-send" aria-label="Gửi"><FiSend size={18} /></button>
+                </form>
+              </>
+            )}
+
+            {showParticipants && (
+              <div className="gm-people-list">
+                <div className="gm-people-title">Trong cuộc họp ({totalPeople})</div>
+                {participants.map(p => {
+                  const isMe = p.socketId === socketRef.current?.id;
+                  const muted = isMe ? !micOn : peerMicOff.has(p.socketId);
+                  return (
+                    <div key={p.socketId} className="gm-person">
+                      <div className="gm-person-avatar" style={{ background: colorFor(p.userName).avatar }}>
+                        {initialOf(p.userName)}
+                      </div>
+                      <span className="gm-person-name">{p.userName}{isMe ? ' (Bạn)' : ''}</span>
+                      {(isMe ? handRaised : raisedHands.has(p.socketId)) && <MdPanTool size={16} color="#f9ab00" />}
+                      {muted ? <FiMicOff size={16} color="#5f6368" /> : <FiMic size={16} color="#5f6368" />}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </aside>
+        )}
       </div>
+
+      {/* ── Thanh điều khiển ───────────────────────────────── */}
+      <footer className="gm-bar">
+        <div className="gm-bar-left">
+          <span>{timeLabel}</span>
+          <span className="gm-bar-sep">|</span>
+          <span className="gm-bar-code" title={meetingCode}>{meetingCode?.slice(0, 12)}</span>
+          <button type="button" className="gm-icon-btn-plain" onClick={copyMeetingLink} title="Sao chép liên kết cuộc họp">
+            {copied ? <FiCheck size={16} /> : <FiCopy size={16} />}
+          </button>
+        </div>
+
+        <div className="gm-bar-center">
+          <button type="button" className={`gm-btn ${!micOn ? 'is-off' : ''}`} onClick={toggleMic} title={micOn ? 'Tắt micrô' : 'Bật micrô'}>
+            {micOn ? <FiMic size={20} /> : <FiMicOff size={20} />}
+          </button>
+          <button type="button" className={`gm-btn ${!camOn ? 'is-off' : ''}`} onClick={toggleCam} disabled={screenSharing} title={camOn ? 'Tắt camera' : 'Bật camera'}>
+            {camOn ? <FiVideo size={20} /> : <FiVideoOff size={20} />}
+          </button>
+          <button type="button" className={`gm-btn ${screenSharing ? 'is-active' : ''}`} onClick={toggleScreenShare} title={screenSharing ? 'Dừng trình bày' : 'Trình bày ngay bây giờ'}>
+            <FiMonitor size={20} />
+          </button>
+          <button type="button" className={`gm-btn ${handRaised ? 'is-active' : ''}`} onClick={toggleHand} title={handRaised ? 'Hạ tay xuống' : 'Giơ tay'}>
+            {handRaised ? <MdPanTool size={22} /> : <MdOutlinePanTool size={22} />}
+          </button>
+          <button type="button" className="gm-btn gm-btn-leave" onClick={leaveRoom} title="Rời khỏi cuộc họp">
+            <FiPhoneOff size={22} />
+          </button>
+        </div>
+
+        <div className="gm-bar-right">
+          <button type="button" className={`gm-btn-side ${showParticipants ? 'is-active' : ''}`}
+            onClick={() => { setShowParticipants(!showParticipants); setChatOpen(false); }} title="Mọi người">
+            <FiUsers size={20} />
+            <span className="gm-badge gm-badge-count">{totalPeople}</span>
+          </button>
+          <button type="button" className={`gm-btn-side ${chatOpen ? 'is-active' : ''}`}
+            onClick={() => { setChatOpen(!chatOpen); setShowParticipants(false); }} title="Trò chuyện với mọi người">
+            <FiMessageSquare size={20} />
+            {unreadChat > 0 && !chatOpen && <span className="gm-badge gm-badge-unread">{unreadChat}</span>}
+          </button>
+        </div>
+      </footer>
 
       <style>{meetingStyles}</style>
     </div>
   );
 }
 
-// ── Remote Video Tile Component ──────────────────────────────
-function RemoteVideoTile({ peerId: _peerId, stream, name, camOff, handUp, isPinned, onTogglePin }: {
-  peerId: string;
-  stream: MediaStream;
+// ── Màu avatar / nền tile theo tên (giống Google Meet) ───────
+const TILE_COLORS = [
+  { bg: 'radial-gradient(circle at 50% 40%, #a8421c, #5e2410)', avatar: '#f4511e' },
+  { bg: 'radial-gradient(circle at 50% 40%, #15518f, #0b2d52)', avatar: '#1a73e8' },
+  { bg: 'radial-gradient(circle at 50% 40%, #0f7a86, #084a52)', avatar: '#12a4af' },
+  { bg: 'radial-gradient(circle at 50% 40%, #2f7a2f, #1a4a1a)', avatar: '#34a853' },
+  { bg: 'radial-gradient(circle at 50% 40%, #6a3a99, #3a2054)', avatar: '#8e44ad' },
+  { bg: 'radial-gradient(circle at 50% 40%, #7a6a1c, #4a410f)', avatar: '#c9a227' },
+  { bg: 'radial-gradient(circle at 50% 40%, #9a3562, #5a1f3a)', avatar: '#d81b60' },
+];
+function colorFor(name: string) {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+  return TILE_COLORS[h % TILE_COLORS.length];
+}
+function initialOf(name: string) {
+  return (name.trim()[0] || '?').toUpperCase();
+}
+
+// ── Video Tile (dùng cho cả mình và người khác) ──────────────
+function VideoTile({ name, stream, isSelf, showVideo, micOff, handUp, presenting, pinned, onTogglePin, style }: {
   name: string;
-  camOff: boolean;
+  stream: MediaStream | null;
+  isSelf: boolean;
+  showVideo: boolean;
+  micOff: boolean;
   handUp: boolean;
-  isPinned: boolean;
+  presenting: boolean;
+  pinned: boolean;
   onTogglePin: () => void;
+  style?: CSSProperties;
 }) {
   const ref = useRef<HTMLVideoElement>(null);
-  useEffect(() => { if (ref.current) ref.current.srcObject = stream; }, [stream]);
+  useEffect(() => {
+    const v = ref.current;
+    if (!v) return;
+    if (v.srcObject !== stream) v.srcObject = stream;
+    if (stream) v.play().catch(() => { /* autoplay bị chặn */ });
+  }, [stream]);
+
+  const palette = colorFor(name);
+  const mirrored = isSelf && !presenting;
+
   return (
-    <div className={`video-tile ${handUp ? 'hand-raised' : ''} ${isPinned ? 'pinned' : ''}`} onDoubleClick={onTogglePin}>
-      <video ref={ref} autoPlay playsInline />
-      {camOff && (
-        <div className="video-placeholder">
-          <div className="video-avatar">{name[0]?.toUpperCase() || '?'}</div>
-        </div>
+    <div
+      className={`gm-tile ${handUp ? 'is-hand' : ''} ${pinned ? 'is-pinned' : ''}`}
+      style={{ ...style, background: palette.bg }}
+      onDoubleClick={onTogglePin}
+    >
+      <video
+        ref={ref}
+        autoPlay
+        playsInline
+        muted={isSelf}
+        style={{
+          opacity: showVideo ? 1 : 0,
+          objectFit: presenting ? 'contain' : 'cover',
+          transform: mirrored ? 'scaleX(-1)' : 'none',
+          background: presenting ? '#000' : 'transparent',
+        }}
+      />
+      {!showVideo && (
+        <div className="gm-avatar" style={{ background: palette.avatar }}>{initialOf(name)}</div>
       )}
-      <div className="video-tile-label">
-        <span>{name}</span>
-        {handUp && <span className="hand-icon">✋</span>}
-      </div>
+
+      {handUp && <div className="gm-hand-chip"><MdPanTool size={16} /></div>}
+      {micOff && <div className="gm-mic-chip"><FiMicOff size={14} /></div>}
+
+      <button type="button" className="gm-pin-btn" onClick={(e) => { e.stopPropagation(); onTogglePin(); }}
+        title={pinned ? 'Bỏ ghim' : 'Ghim'}>
+        {pinned ? <MdPushPin size={20} /> : <MdOutlinePushPin size={20} />}
+      </button>
+
+      <div className="gm-name">{name}</div>
     </div>
   );
 }
 
-// ── Styles ───────────────────────────────────────────────────
+// ── Styles (phong cách Google Meet) ──────────────────────────
 const meetingStyles = `
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+  .gm-root {
+    width: 100vw; height: 100vh; background: #202124; color: #fff;
+    display: flex; flex-direction: column; overflow: hidden;
+    font-family: 'Google Sans', 'Segoe UI', Roboto, Arial, sans-serif;
+  }
+  .gm-body { flex: 1; min-height: 0; display: flex; gap: 8px; padding: 8px 8px 0; }
+  .gm-stage { flex: 1; min-width: 0; position: relative; overflow: hidden; display: flex; align-items: center; justify-content: center; }
 
-  .meeting-room {
-    width: 100vw; height: 100vh;
-    background: #0F0F1A;
-    display: flex; flex-direction: column;
-    position: relative; overflow: hidden;
-    font-family: 'Inter', sans-serif;
+  /* Lưới video: tile vừa khít, canh giữa */
+  .gm-grid { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; align-content: center; max-width: 100%; max-height: 100%; }
+
+  /* Chế độ trình bày / ghim */
+  .gm-present-layout { display: flex; gap: 8px; width: 100%; height: 100%; }
+  .gm-present-main { flex: 1; min-width: 0; height: 100%; }
+  .gm-present-side {
+    width: 300px; flex-shrink: 0; overflow-y: auto; height: 100%;
+    display: grid; grid-template-columns: 1fr; align-content: start; gap: 8px; padding-right: 2px;
+  }
+  .gm-present-side::-webkit-scrollbar { width: 6px; }
+  .gm-present-side::-webkit-scrollbar-thumb { background: #5f6368; border-radius: 3px; }
+  @media (min-width: 1400px) { .gm-present-side { width: 340px; grid-template-columns: 1fr 1fr; } }
+  .gm-present-chip {
+    position: absolute; top: 10px; left: 10px; z-index: 5;
+    background: rgba(32,33,36,0.85); color: #fff; padding: 6px 14px; border-radius: 18px;
+    font-size: 13px; font-weight: 500; backdrop-filter: blur(6px);
   }
 
-  /* ── Video Grid ──────────────────────────────────────── */
-  .video-grid {
-    flex: 1; display: grid; gap: 8px;
-    padding: 12px; overflow: hidden;
-    transition: all 0.3s ease;
-  }
-  .video-grid-1 { grid-template-columns: 1fr; }
-  .video-grid-2 { grid-template-columns: 1fr 1fr; }
-  .video-grid-3 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
-  .video-grid-3 .video-tile:first-child { grid-column: 1 / -1; }
-  .video-grid-4 { grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr; }
-  .video-grid-5, .video-grid-6 { grid-template-columns: 1fr 1fr 1fr; grid-template-rows: 1fr 1fr; }
-  .video-grid-pinned { grid-template-columns: 1fr; grid-template-rows: 3fr 1fr; }
-  .video-grid-pinned .video-tile:not(.pinned) { max-height: 120px; }
-
-  .video-tile {
-    background: #1A1A2E; border-radius: 12px;
-    position: relative; overflow: hidden;
+  /* Tile */
+  .gm-tile {
+    position: relative; border-radius: 12px; overflow: hidden;
     display: flex; align-items: center; justify-content: center;
-    border: 2px solid transparent;
-    transition: border-color 0.3s ease, box-shadow 0.3s ease;
+    border: 2px solid transparent; box-sizing: border-box; flex-shrink: 0;
   }
-  .video-tile:hover { border-color: rgba(255,255,255,0.1); }
-  .video-tile.pinned {
-    border-color: rgba(79, 70, 229, 0.6);
-    box-shadow: 0 0 20px rgba(79, 70, 229, 0.2);
-    grid-column: 1 / -1;
-  }
-  .video-tile.hand-raised {
-    border-color: rgba(251, 191, 36, 0.6);
-    animation: hand-pulse 1.5s ease-in-out infinite;
-  }
-  @keyframes hand-pulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(251, 191, 36, 0.3); }
-    50% { box-shadow: 0 0 0 8px rgba(251, 191, 36, 0); }
-  }
-  .video-tile video {
-    width: 100%; height: 100%;
-    object-fit: cover; transform: scaleX(-1);
-  }
-  .video-tile-label {
-    position: absolute; bottom: 10px; left: 10px;
-    background: rgba(0,0,0,0.65);
-    color: white; padding: 4px 12px; border-radius: 8px;
-    font-size: 12px; font-weight: 500;
-    display: flex; align-items: center; gap: 6px;
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
-  }
-  .mic-off-icon { font-size: 11px; }
-  .hand-icon { font-size: 14px; animation: hand-wave 0.6s ease-in-out infinite alternate; }
-  @keyframes hand-wave {
-    0% { transform: rotate(-10deg); }
-    100% { transform: rotate(10deg); }
-  }
-  .sharing-badge {
-    position: absolute; top: 10px; left: 10px;
-    background: linear-gradient(135deg, #4F46E5, #7C3AED);
-    color: white; padding: 4px 12px; border-radius: 8px;
-    font-size: 11px; font-weight: 600;
-    animation: pulse-badge 2s ease-in-out infinite;
-  }
-  @keyframes pulse-badge {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.7; }
-  }
-  .video-placeholder {
-    position: absolute; inset: 0;
+  .gm-tile video { position: absolute; inset: 0; width: 100%; height: 100%; transition: opacity .2s; }
+  .gm-tile.is-hand { border-color: #f9ab00; }
+  .gm-tile.is-pinned { border-color: #8ab4f8; }
+  .gm-avatar {
+    position: relative; z-index: 1;
+    width: 22%; max-width: 110px; min-width: 44px; aspect-ratio: 1; border-radius: 50%;
     display: flex; align-items: center; justify-content: center;
-    background: linear-gradient(135deg, #1A1A2E, #16162A);
+    font-size: clamp(20px, 3.2vw, 44px); font-weight: 500; color: #fff;
   }
-  .video-avatar {
-    width: 72px; height: 72px; border-radius: 50%;
-    background: linear-gradient(135deg, #4F46E5, #7C3AED);
+  .gm-name {
+    position: absolute; left: 12px; bottom: 8px; z-index: 2; max-width: 75%;
+    font-size: 13px; font-weight: 500; color: #fff; text-shadow: 0 1px 3px rgba(0,0,0,.8);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .gm-mic-chip {
+    position: absolute; top: 8px; right: 8px; z-index: 2;
+    width: 26px; height: 26px; border-radius: 50%; background: rgba(32,33,36,.75);
+    display: flex; align-items: center; justify-content: center; color: #fff;
+  }
+  .gm-hand-chip {
+    position: absolute; top: 8px; left: 8px; z-index: 2;
+    width: 28px; height: 28px; border-radius: 50%; background: #fff; color: #f9ab00;
     display: flex; align-items: center; justify-content: center;
-    font-size: 28px; font-weight: 700; color: white;
-    box-shadow: 0 4px 20px rgba(79, 70, 229, 0.4);
   }
+  .gm-pin-btn {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 3;
+    width: 44px; height: 44px; border-radius: 50%; border: none; cursor: pointer;
+    background: rgba(32,33,36,.75); color: #fff; display: none; align-items: center; justify-content: center;
+  }
+  .gm-pin-btn:hover { background: rgba(60,64,67,.95); }
+  .gm-tile:hover .gm-pin-btn { display: flex; }
+  .gm-more { background: #3c4043 !important; flex-direction: column; gap: 8px; }
+  .gm-more-avatar {
+    width: 64px; height: 64px; border-radius: 50%; background: #5f6368;
+    display: flex; align-items: center; justify-content: center; font-size: 22px; font-weight: 500;
+  }
+  .gm-more-text { font-size: 14px; color: #e8eaed; }
 
-  /* ── Control Dock ────────────────────────────────────── */
-  .control-dock {
-    height: 80px;
-    background: rgba(15, 15, 26, 0.97);
-    border-top: 1px solid rgba(255, 255, 255, 0.06);
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 0 24px;
-    backdrop-filter: blur(12px);
-    -webkit-backdrop-filter: blur(12px);
+  /* Panel bên phải */
+  .gm-panel {
+    width: 360px; flex-shrink: 0; background: #fff; color: #202124;
+    border-radius: 16px; display: flex; flex-direction: column; overflow: hidden;
+    margin-bottom: 8px;
   }
-  .meeting-info {
-    display: flex; align-items: center; gap: 8px;
-    color: rgba(255, 255, 255, 0.4); font-size: 13px;
-    min-width: 200px;
+  .gm-panel-header { display: flex; align-items: center; justify-content: space-between; padding: 16px 12px 8px 24px; }
+  .gm-panel-header h3 { margin: 0; font-size: 18px; font-weight: 500; }
+  .gm-icon-btn-plain {
+    background: transparent; border: none; color: inherit; cursor: pointer;
+    width: 36px; height: 36px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
   }
-  .meeting-info svg { opacity: 0.5; }
-  .control-buttons { display: flex; align-items: center; gap: 6px; }
-  .control-btn {
-    display: flex; flex-direction: column; align-items: center; gap: 3px;
-    padding: 8px 14px; border-radius: 12px;
-    background: rgba(255, 255, 255, 0.06);
-    color: rgba(255, 255, 255, 0.75);
-    transition: all 0.2s ease;
-    cursor: pointer; border: none; font-family: inherit;
+  .gm-icon-btn-plain:hover { background: rgba(128,128,128,.2); }
+  .gm-chat-note {
+    margin: 4px 16px 8px; padding: 10px 14px; background: #f1f3f4; border-radius: 8px;
+    font-size: 12px; color: #5f6368; text-align: center;
   }
-  .control-btn svg { width: 20px; height: 20px; }
-  .control-btn span { font-size: 10px; font-weight: 500; white-space: nowrap; }
-  .control-btn:hover { background: rgba(255, 255, 255, 0.12); color: white; transform: translateY(-1px); }
-  .control-btn:active { transform: translateY(0); }
-  .control-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-  .control-btn-off { background: rgba(239, 68, 68, 0.15); color: #EF4444; }
-  .control-btn-off:hover { background: rgba(239, 68, 68, 0.25); color: #F87171; }
-  .control-btn-active { background: rgba(79, 70, 229, 0.25); color: #A5B4FC; }
-  .control-btn-active:hover { background: rgba(79, 70, 229, 0.35); color: #C7D2FE; }
-  .control-btn-danger { background: #EF4444; color: white; }
-  .control-btn-danger:hover { background: #DC2626; transform: translateY(-1px); }
-
-  /* ── Chat Panel ──────────────────────────────────────── */
-  .chat-panel {
-    position: absolute; top: 0; right: 0;
-    width: 340px; height: calc(100% - 80px);
-    background: #1A1A2E;
-    border-left: 1px solid rgba(255, 255, 255, 0.06);
-    display: flex; flex-direction: column;
-    transform: translateX(100%);
-    transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-    z-index: 20;
-    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.3);
+  .gm-chat-list { flex: 1; overflow-y: auto; padding: 8px 20px; display: flex; flex-direction: column; gap: 14px; }
+  .gm-chat-empty { margin: auto; color: #80868b; font-size: 14px; }
+  .gm-chat-meta { display: flex; align-items: baseline; gap: 8px; font-size: 13px; }
+  .gm-chat-meta strong { font-weight: 600; }
+  .gm-chat-meta span { color: #5f6368; font-size: 12px; }
+  .gm-chat-text { font-size: 14px; margin-top: 2px; white-space: pre-wrap; word-break: break-word; }
+  .gm-chat-form {
+    margin: 8px 16px 16px; display: flex; align-items: center; gap: 4px;
+    background: #f1f3f4; border-radius: 24px; padding: 4px 6px 4px 18px;
   }
-  .chat-panel.open { transform: translateX(0); }
-  .chat-header {
-    padding: 16px 18px;
-    display: flex; align-items: center; justify-content: space-between;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-    background: rgba(26, 26, 46, 0.95);
-  }
-  .chat-header h3 {
-    color: white; font-size: 14px; font-weight: 600; margin: 0;
-  }
-  .chat-close-btn {
-    color: rgba(255, 255, 255, 0.4); cursor: pointer;
-    background: none; border: none; font-size: 18px;
-    width: 28px; height: 28px; border-radius: 6px;
+  .gm-chat-form input { flex: 1; border: none; background: transparent; outline: none; font-size: 14px; padding: 10px 0; color: #202124; }
+  .gm-chat-send {
+    width: 38px; height: 38px; border-radius: 50%; border: none; background: transparent; color: #1a73e8; cursor: pointer;
     display: flex; align-items: center; justify-content: center;
-    transition: all 0.15s ease;
   }
-  .chat-close-btn:hover { background: rgba(255,255,255,0.08); color: white; }
-  .chat-messages {
-    flex: 1; padding: 16px; overflow-y: auto;
-    display: flex; flex-direction: column; gap: 8px;
+  .gm-chat-send:hover { background: rgba(26,115,232,.1); }
+  .gm-people-list { flex: 1; overflow-y: auto; padding: 4px 12px 16px; }
+  .gm-people-title { font-size: 13px; color: #5f6368; padding: 8px 12px; font-weight: 500; }
+  .gm-person { display: flex; align-items: center; gap: 12px; padding: 8px 12px; border-radius: 8px; }
+  .gm-person:hover { background: #f1f3f4; }
+  .gm-person-avatar {
+    width: 36px; height: 36px; border-radius: 50%; color: #fff; font-weight: 500;
+    display: flex; align-items: center; justify-content: center; flex-shrink: 0;
   }
-  .chat-empty {
-    flex: 1; display: flex; flex-direction: column;
-    align-items: center; justify-content: center;
-    color: rgba(255, 255, 255, 0.3); text-align: center;
-  }
-  .chat-empty span { font-size: 40px; margin-bottom: 12px; opacity: 0.4; }
-  .chat-empty p { margin: 0; font-size: 14px; font-weight: 500; }
-  .chat-empty-sub { font-size: 12px !important; margin-top: 4px !important; opacity: 0.7; }
-  .chat-msg {
-    max-width: 85%; padding: 8px 12px; border-radius: 12px;
-    font-size: 13px; line-height: 1.4; word-break: break-word;
-  }
-  .chat-msg.own {
-    align-self: flex-end;
-    background: linear-gradient(135deg, #4F46E5, #6366F1);
-    color: white; border-bottom-right-radius: 4px;
-  }
-  .chat-msg.other {
-    align-self: flex-start;
-    background: rgba(255, 255, 255, 0.06); color: #E2E8F0;
-    border-bottom-left-radius: 4px;
-  }
-  .chat-msg-sender {
-    font-size: 11px; font-weight: 600; color: #A5B4FC;
-    margin-bottom: 2px;
-  }
-  .chat-msg-text { word-break: break-word; }
-  .chat-msg-time {
-    font-size: 10px; opacity: 0.5; margin-top: 4px;
-    text-align: right;
-  }
-  .chat-input-area {
-    padding: 12px 16px;
-    border-top: 1px solid rgba(255, 255, 255, 0.06);
-    background: rgba(26, 26, 46, 0.95);
-  }
-  .chat-input-area form {
-    display: flex; gap: 8px; align-items: center;
-  }
-  .chat-input-area input {
-    flex: 1; padding: 10px 14px; border-radius: 10px;
-    background: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    color: white; font-size: 13px; outline: none;
-    font-family: inherit;
-    transition: border-color 0.2s ease;
-  }
-  .chat-input-area input:focus { border-color: rgba(79, 70, 229, 0.5); }
-  .chat-input-area input::placeholder { color: rgba(255,255,255,0.3); }
-  .chat-send-btn {
-    width: 38px; height: 38px; border-radius: 10px;
-    background: linear-gradient(135deg, #4F46E5, #6366F1);
-    color: white; border: none; cursor: pointer;
-    display: flex; align-items: center; justify-content: center;
-    transition: all 0.2s ease; flex-shrink: 0;
-  }
-  .chat-send-btn:hover { transform: scale(1.05); box-shadow: 0 2px 12px rgba(79, 70, 229, 0.4); }
+  .gm-person-name { flex: 1; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-  /* ── Participants Drawer ─────────────────────────────── */
-  .participants-drawer {
-    position: absolute; top: 0; right: 0;
-    width: 300px; height: calc(100% - 80px);
-    background: #1A1A2E;
-    border-left: 1px solid rgba(255, 255, 255, 0.06);
-    display: flex; flex-direction: column; z-index: 20;
-    box-shadow: -8px 0 24px rgba(0, 0, 0, 0.3);
-    animation: slide-in-right 0.3s ease;
+  /* Thanh điều khiển */
+  .gm-bar { height: 80px; flex-shrink: 0; display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; padding: 0 16px; }
+  .gm-bar-left { display: flex; align-items: center; gap: 10px; font-size: 14px; color: #e8eaed; min-width: 0; }
+  .gm-bar-left .gm-icon-btn-plain { color: #bdc1c6; width: 30px; height: 30px; }
+  .gm-bar-sep { color: #5f6368; }
+  .gm-bar-code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gm-bar-center { display: flex; align-items: center; gap: 10px; }
+  .gm-bar-right { display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+  .gm-btn {
+    width: 48px; height: 48px; border-radius: 50%; border: none; cursor: pointer;
+    background: #3c4043; color: #e8eaed; display: flex; align-items: center; justify-content: center;
+    transition: background .15s, border-radius .15s;
   }
-  @keyframes slide-in-right {
-    from { transform: translateX(100%); }
-    to { transform: translateX(0); }
+  .gm-btn:hover:not(:disabled) { background: #4a4e51; }
+  .gm-btn:disabled { opacity: .45; cursor: not-allowed; }
+  .gm-btn.is-off { background: #ea4335; color: #fff; }
+  .gm-btn.is-off:hover:not(:disabled) { background: #d93025; }
+  .gm-btn.is-active { background: #8ab4f8; color: #202124; }
+  .gm-btn-leave { width: 64px; border-radius: 24px; background: #ea4335; color: #fff; }
+  .gm-btn-leave:hover { background: #d93025 !important; }
+  .gm-btn-side {
+    position: relative; width: 48px; height: 48px; border-radius: 50%; border: none; cursor: pointer;
+    background: transparent; color: #e8eaed; display: flex; align-items: center; justify-content: center;
   }
-  .drawer-header {
-    padding: 16px 18px;
-    display: flex; align-items: center; justify-content: space-between;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
-    color: white; font-weight: 600; font-size: 14px;
+  .gm-btn-side:hover { background: rgba(255,255,255,.1); }
+  .gm-btn-side.is-active { color: #8ab4f8; }
+  .gm-badge {
+    position: absolute; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px;
+    font-size: 11px; font-weight: 600; display: flex; align-items: center; justify-content: center;
   }
-  .drawer-header button {
-    color: rgba(255, 255, 255, 0.4); cursor: pointer;
-    background: none; border: none; font-size: 18px;
-    width: 28px; height: 28px; border-radius: 6px;
-    display: flex; align-items: center; justify-content: center;
-    transition: all 0.15s ease;
-  }
-  .drawer-header button:hover { background: rgba(255,255,255,0.08); color: white; }
-  .drawer-body { padding: 12px; overflow-y: auto; flex: 1; }
-  .participant-item {
-    display: flex; align-items: center; gap: 10px;
-    padding: 10px 12px; border-radius: 10px;
-    color: rgba(255, 255, 255, 0.8); font-size: 13px;
-    transition: background 0.15s ease;
-  }
-  .participant-item:hover { background: rgba(255, 255, 255, 0.04); }
-  .participant-avatar {
-    width: 34px; height: 34px; border-radius: 50%;
-    background: linear-gradient(135deg, #4F46E5, #7C3AED);
-    display: flex; align-items: center; justify-content: center;
-    font-size: 14px; font-weight: 700; color: white; flex-shrink: 0;
-  }
-  .you-badge {
-    font-size: 11px; color: rgba(255, 255, 255, 0.3);
-    margin-left: auto;
-  }
-  .hand-icon-small { margin-left: auto; font-size: 16px; }
+  .gm-badge-count { right: 2px; bottom: 4px; background: #5f6368; color: #fff; }
+  .gm-badge-unread { right: 2px; top: 4px; background: #1a73e8; color: #fff; }
 
-  /* ── Scrollbar ───────────────────────────────────────── */
-  .chat-messages::-webkit-scrollbar,
-  .drawer-body::-webkit-scrollbar { width: 4px; }
-  .chat-messages::-webkit-scrollbar-thumb,
-  .drawer-body::-webkit-scrollbar-thumb {
-    background: rgba(255,255,255,0.15); border-radius: 4px;
-  }
-  .chat-messages::-webkit-scrollbar-track,
-  .drawer-body::-webkit-scrollbar-track { background: transparent; }
-
-  /* ── Responsive ──────────────────────────────────────── */
-  @media (max-width: 768px) {
-    .chat-panel { width: 100%; }
-    .participants-drawer { width: 100%; }
-    .control-dock { padding: 0 8px; height: 70px; }
-    .control-btn { padding: 6px 10px; }
-    .control-btn span { display: none; }
-    .meeting-info { display: none; }
-    .video-grid { padding: 6px; gap: 4px; }
+  @media (max-width: 900px) {
+    .gm-panel { position: fixed; right: 8px; top: 8px; bottom: 88px; width: calc(100vw - 16px); max-width: 360px; z-index: 20; }
+    .gm-present-side { width: 140px; }
+    .gm-bar { grid-template-columns: auto 1fr; }
+    .gm-bar-left { display: none; }
   }
 `;
+
+

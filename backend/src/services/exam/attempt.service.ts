@@ -3,7 +3,12 @@ import type { PoolClient } from 'pg';
 import { query, queryOne, withTransaction, pool } from '../../config/database.js';
 import { HttpError } from '../../utils/http-error.js';
 import { registerFace, AiInputError, AiServiceError } from '../proctoring/ai-client.js';
-import { saveEvidenceImage } from '../proctoring/storage.js';
+import {
+  saveEvidenceImage,
+  saveAttemptAnswerFile,
+  readAttemptAnswerFile,
+  deleteAttemptAnswerFile,
+} from '../proctoring/storage.js';
 import { broadcastAttemptStatus, getMonitorIo } from '../../sockets/monitor.socket.js';
 import { computeStudentResultVisibility } from './visibility.js';
 
@@ -192,7 +197,7 @@ export async function getAttemptForStudent(clientOrPool: PoolClient | typeof poo
   const settings = (await (clientOrPool as any).query('SELECT * FROM exam_proctoring_settings WHERE exam_id = $1', [row.exam_id])).rows[0];
 
   const questionRows = (await (clientOrPool as any).query(
-    `SELECT eq.id, eq.position, eq.question_type, eq.content, eq.points,
+    `SELECT eq.id, eq.position, eq.question_type, eq.content, eq.points, eq.explanation,
             bq.chapter AS chapter,
             COALESCE(bq.difficulty, 'medium') AS difficulty
        FROM exam_questions eq
@@ -203,7 +208,7 @@ export async function getAttemptForStudent(clientOrPool: PoolClient | typeof poo
   const byId = new Map<number, any>(questionRows.map((q: any) => [q.id, q]));
 
   const optionRows = (await (clientOrPool as any).query(
-    `SELECT id, exam_question_id, content, position FROM exam_question_options WHERE exam_question_id = ANY($1)`,
+    `SELECT id, exam_question_id, content, position, is_correct FROM exam_question_options WHERE exam_question_id = ANY($1)`,
     [row.question_order],
   )).rows;
 
@@ -231,13 +236,19 @@ export async function getAttemptForStudent(clientOrPool: PoolClient | typeof poo
 
   const optionOrder = row.option_order ?? {};
   const orderedQuestions = row.question_order.map((qId: number, index: number) => {
-    const q = byId.get(qId) || {};
+    const { explanation, ...qBase } = byId.get(qId) || {};
     const ids: number[] = optionOrder[qId] ?? optionRows.filter((o: any) => o.exam_question_id === qId).map((o: any) => o.id);
     const options = ids.map((oid) => optionRows.find((o: any) => o.id === oid)).filter(Boolean)
-      .map((o: any, optIdx: number) => ({ id: o.id, content: o.content, position: o.position ?? optIdx + 1 }));
+      .map((o: any, optIdx: number) => ({
+        id: o.id,
+        content: o.content,
+        position: o.position ?? optIdx + 1,
+        ...(canReviewAnswers ? { is_correct: Boolean(o.is_correct) } : {}),
+      }));
     return {
-      ...q,
-      position: q.position ?? index + 1,
+      ...qBase,
+      ...(canReviewAnswers ? { explanation: explanation ?? null } : {}),
+      position: qBase.position ?? index + 1,
       indexNumber: index + 1,
       options,
       answer: answerByQ.get(qId) ?? null,
@@ -357,6 +368,136 @@ export async function saveAnswer(attemptId: number, examQuestionId: number, payl
       ],
     );
   });
+}
+
+/** Tải lên tệp bài làm cho câu hỏi thuộc loại `file_upload`. */
+export async function uploadAnswerFile(
+  attemptId: number,
+  examQuestionId: number,
+  file: { originalname: string; buffer: Buffer; size?: number },
+) {
+  let savedRelPathOnDisk: string | null = null;
+
+  try {
+    const { previousFilePath, saved } = await withTransaction(async (client) => {
+      const attempt = await one(client, 'SELECT * FROM exam_attempts WHERE id = $1 FOR UPDATE', [attemptId]);
+      if (!attempt) throw new HttpError(404, 'Không tìm thấy lần làm bài');
+      if (attempt.status !== 'in_progress') throw new HttpError(400, 'Bài đã nộp, không thể tải tệp mới');
+      if (new Date(attempt.deadline_at) < new Date()) throw new HttpError(400, 'Đã hết thời gian làm bài');
+
+      const questionOrderIds: number[] = Array.isArray(attempt.question_order)
+        ? attempt.question_order.map(Number)
+        : [];
+      if (!questionOrderIds.includes(Number(examQuestionId))) {
+        throw new HttpError(400, 'Câu hỏi không thuộc lần làm bài này');
+      }
+
+      const qRow = await one(
+        client,
+        'SELECT id, question_type FROM exam_questions WHERE id = $1 AND exam_id = $2',
+        [examQuestionId, attempt.exam_id],
+      );
+      if (!qRow) throw new HttpError(404, 'Không tìm thấy câu hỏi');
+      if (qRow.question_type !== 'file_upload') {
+        throw new HttpError(400, 'Chỉ câu hỏi loại nộp tệp / mã nguồn mới hỗ trợ đính kèm tệp');
+      }
+
+      const existingAns = await one(
+        client,
+        'SELECT file_path FROM attempt_answers WHERE attempt_id = $1 AND exam_question_id = $2',
+        [attemptId, examQuestionId],
+      );
+      const prevPath: string | null = existingAns?.file_path ?? null;
+
+      let stored: { relPath: string; fileName: string; sizeBytes: number };
+      try {
+        stored = await saveAttemptAnswerFile(attemptId, examQuestionId, file.originalname, file.buffer);
+        savedRelPathOnDisk = stored.relPath;
+      } catch (err: any) {
+        throw new HttpError(400, err?.message || 'Tệp tải lên không hợp lệ');
+      }
+
+      await client.query(
+        `INSERT INTO attempt_answers (
+           attempt_id, exam_question_id, selected_option_ids, text_answer, file_path, is_flagged
+         )
+         VALUES ($1, $2, '{}'::int[], NULL, $3, FALSE)
+         ON CONFLICT (attempt_id, exam_question_id) DO UPDATE SET
+           file_path   = EXCLUDED.file_path,
+           answered_at = NOW()`,
+        [attemptId, examQuestionId, stored.relPath],
+      );
+
+      return { previousFilePath: prevPath, saved: stored };
+    });
+
+    if (previousFilePath && previousFilePath !== saved.relPath) {
+      await deleteAttemptAnswerFile(previousFilePath).catch(() => {});
+    }
+
+    return {
+      filePath: saved.relPath,
+      fileName: saved.fileName,
+      sizeBytes: saved.sizeBytes,
+    };
+  } catch (err) {
+    if (savedRelPathOnDisk) {
+      await deleteAttemptAnswerFile(savedRelPathOnDisk).catch(() => {});
+    }
+    throw err;
+  }
+}
+
+/** Đọc tệp bài làm đính kèm (cho phép chủ bài thi hoặc giảng viên/trợ giảng phụ trách lớp). */
+export async function getAnswerFileForDownload(
+  attemptId: number,
+  examQuestionId: number,
+  requester: { userId: number; role?: string },
+) {
+  const row = await queryOne<{
+    attempt_id: number;
+    student_id: number;
+    class_id: number;
+    creator_id: number;
+    file_path: string | null;
+  }>(
+    `SELECT ea.id AS attempt_id,
+            ea.student_id,
+            e.class_id,
+            c.creator_id,
+            aa.file_path
+       FROM exam_attempts ea
+       JOIN exams e ON e.id = ea.exam_id
+       JOIN classes c ON c.id = e.class_id
+       LEFT JOIN attempt_answers aa
+         ON aa.attempt_id = ea.id AND aa.exam_question_id = $2
+      WHERE ea.id = $1`,
+    [attemptId, examQuestionId],
+  );
+  if (!row) throw new HttpError(404, 'Không tìm thấy lượt làm bài');
+
+  const isStudentOwner = Number(row.student_id) === Number(requester.userId);
+  const isClassCreator = Number(row.creator_id) === Number(requester.userId);
+  if (!isStudentOwner && !isClassCreator) {
+    const collab = await queryOne(
+      'SELECT 1 FROM collaborators WHERE class_id = $1 AND user_id = $2',
+      [row.class_id, requester.userId],
+    );
+    if (!collab) {
+      throw new HttpError(403, 'Bạn không có quyền tải tệp bài làm này');
+    }
+  }
+
+  if (!row.file_path) {
+    throw new HttpError(404, 'Câu hỏi này chưa có tệp đính kèm');
+  }
+
+  try {
+    const { buffer, fileName } = await readAttemptAnswerFile(row.file_path);
+    return { buffer, fileName, filePath: row.file_path };
+  } catch {
+    throw new HttpError(404, 'Không tìm thấy tệp đính kèm trên máy chủ');
+  }
 }
 
 // ===========================================================================

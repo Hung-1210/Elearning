@@ -103,46 +103,67 @@ io.on('connection', (socket) => {
 
   let joinedRoomId: string | null = null;
 
+  const removeFromRoom = (roomId: string) => {
+    const room = rooms.get(roomId);
+    if (room) {
+      room.delete(socket.id);
+      if (room.size === 0) rooms.delete(roomId);
+    }
+    socket.to(roomId).emit('user-disconnected', socket.id);
+    io.to(roomId).emit('room-participants', getRoomParticipants(roomId));
+  };
+
   socket.on('join-room', (roomId: string, userId: string, userName: string) => {
+    // Rời phòng cũ nếu socket này đã join phòng khác
+    if (joinedRoomId && joinedRoomId !== roomId) {
+      removeFromRoom(joinedRoomId);
+      socket.leave(joinedRoomId);
+    }
     joinedRoomId = roomId;
     socket.join(roomId);
 
-    // Add participant to room map
     if (!rooms.has(roomId)) rooms.set(roomId, new Map());
     rooms.get(roomId)!.set(socket.id, { userId, userName });
 
     console.log(`User ${userName} (${socket.id}) joined room ${roomId}`);
 
-    // Notify others in room: new user joined
-    socket.to(roomId).emit('user-joined', { socketId: socket.id, userId, userName });
+    // Người đã ở trong phòng sẽ là bên tạo offer tới người mới (khớp MeetingRoom.tsx)
+    socket.to(roomId).emit('user-connected', socket.id, userName);
 
-    // Send existing participants list back to the newly joined user
-    socket.emit('room-participants', getRoomParticipants(roomId));
+    // Cập nhật danh sách người tham gia cho TOÀN BỘ phòng
+    io.to(roomId).emit('room-participants', getRoomParticipants(roomId));
   });
 
   socket.on('leave-room', (roomId: string) => {
-    if (rooms.has(roomId)) {
-      rooms.get(roomId)!.delete(socket.id);
-      if (rooms.get(roomId)!.size === 0) rooms.delete(roomId);
-    }
-    socket.to(roomId).emit('user-left', socket.id);
+    removeFromRoom(roomId);
     socket.leave(roomId);
+    if (joinedRoomId === roomId) joinedRoomId = null;
     console.log(`User left room: ${roomId}`);
   });
 
-  // Relay WebRTC signaling offer/answer/ICE candidate
-  socket.on('signal', ({ to, data }: { to: string; data: unknown }) => {
-    io.to(to).emit('signal', { from: socket.id, data });
+  // ── Relay WebRTC signaling (khớp tên sự kiện của MeetingRoom.tsx) ──
+  socket.on('offer', (to: string, offer: unknown) => {
+    io.to(to).emit('offer', socket.id, offer);
+  });
+  socket.on('answer', (to: string, answer: unknown) => {
+    io.to(to).emit('answer', socket.id, answer);
+  });
+  socket.on('candidate', (to: string, candidate: unknown) => {
+    io.to(to).emit('candidate', socket.id, candidate);
+  });
+
+  // ── Chat: relay qua socket để không phụ thuộc DataChannel ──
+  socket.on('chat-message', (text: unknown) => {
+    if (!joinedRoomId || typeof text !== 'string') return;
+    const clean = text.trim().slice(0, 2000);
+    if (!clean) return;
+    const sender = rooms.get(joinedRoomId)?.get(socket.id)?.userName || 'Ẩn danh';
+    socket.to(joinedRoomId).emit('chat-message', { sender, text: clean, timestamp: Date.now() });
   });
 
   socket.on('disconnect', () => {
-    if (joinedRoomId && rooms.has(joinedRoomId)) {
-      rooms.get(joinedRoomId)!.delete(socket.id);
-      if (rooms.get(joinedRoomId)!.size === 0) {
-        rooms.delete(joinedRoomId);
-      }
-      socket.to(joinedRoomId).emit('user-disconnected', socket.id);
-      io.to(joinedRoomId).emit('room-participants', getRoomParticipants(joinedRoomId));
+    if (joinedRoomId) {
+      removeFromRoom(joinedRoomId);
       console.log(`Socket ${socket.id} disconnected from room ${joinedRoomId}`);
     }
   });

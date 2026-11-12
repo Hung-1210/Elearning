@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
+import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   FiArrowLeft,
   FiShield,
@@ -15,11 +15,13 @@ import {
   FiActivity,
   FiVideo,
   FiCheckCircle,
+  FiDownload,
 } from 'react-icons/fi';
 import { examApi, classApi } from '../../api';
 import type { ClassInfo, BehaviorStat } from '../../types';
 import Sidebar from '../../components/layout/Sidebar';
 import { useLayoutStore } from '../../store/layoutStore';
+import { triggerBlobDownload } from './examUtils';
 import './exam.css';
 
 interface ViolationDetails {
@@ -93,6 +95,8 @@ interface TimelineEpisode {
 export const ExamViolationsPage: React.FC = () => {
   const { examId } = useParams<{ examId: string }>();
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
+  const queryAttemptId = searchParams.get('attemptId');
   const { sidebarCollapsed } = useLayoutStore();
 
   const [allClasses, setAllClasses] = useState<ClassInfo[]>([]);
@@ -112,6 +116,18 @@ export const ExamViolationsPage: React.FC = () => {
   const [attemptTimeline, setAttemptTimeline] = useState<TimelineEpisode[]>([]);
   const [verdictNote, setVerdictNote] = useState('');
   const [savingVerdict, setSavingVerdict] = useState(false);
+  const [exportingFormat, setExportingFormat] = useState<'xlsx' | 'csv' | null>(null);
+  const [toastNotice, setToastNotice] = useState<{
+    text: string;
+    tone: 'success' | 'error';
+  } | null>(null);
+
+  const showToast = useCallback((text: string, tone: 'success' | 'error' = 'success') => {
+    setToastNotice({ text, tone });
+    window.setTimeout(() => {
+      setToastNotice((cur) => (cur?.text === text ? null : cur));
+    }, 4000);
+  }, []);
 
   // Modal xem ảnh bằng chứng riêng tư qua blob xác thực
   const [selectedEvidence, setSelectedEvidence] = useState<ViolationRecord | null>(null);
@@ -135,6 +151,7 @@ export const ExamViolationsPage: React.FC = () => {
       setAnalytics(data?.analytics || null);
       setSelectedAttemptId((prev) => {
         if (prev && list.some((v) => v.attempt_id === prev)) return prev;
+        if (queryAttemptId && list.some((v) => v.attempt_id === queryAttemptId)) return queryAttemptId;
         return list[0]?.attempt_id ?? null;
       });
     } catch (err) {
@@ -144,7 +161,7 @@ export const ExamViolationsPage: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, [examId]);
+  }, [examId, queryAttemptId]);
 
   useEffect(() => {
     void loadViolations();
@@ -227,8 +244,17 @@ export const ExamViolationsPage: React.FC = () => {
           prev ? { ...prev, review_status: status, review_note: note ?? prev.review_note } : null,
         );
       }
+      showToast(
+        status === 'confirmed_cheating'
+          ? 'Đã đánh dấu xác nhận vi phạm cho sự kiện.'
+          : 'Đã đánh dấu bỏ qua cảnh báo nhầm.',
+        'success',
+      );
     } catch (err: any) {
-      alert(err.response?.data?.error || 'Không thể cập nhật trạng thái duyệt sự kiện.');
+      showToast(
+        err.response?.data?.error || 'Không thể cập nhật trạng thái duyệt sự kiện.',
+        'error',
+      );
     }
   };
 
@@ -239,11 +265,32 @@ export const ExamViolationsPage: React.FC = () => {
       await examApi.reviewAttempt(selectedAttemptId, verdict, verdictNote.trim() || undefined);
       const label =
         verdict === 'confirmed_cheating' ? 'Xác nhận gian lận' : verdict === 'suspected' ? 'Cần xem xét' : 'Hợp lệ';
-      alert(`Đã lưu kết luận "${label}" cho bài thi của thí sinh.`);
+      showToast(`Đã lưu kết luận "${label}" cho bài thi của thí sinh.`, 'success');
     } catch (err: any) {
-      alert(err.response?.data?.error || 'Không thể lưu kết luận hậu kiểm.');
+      showToast(err.response?.data?.error || 'Không thể lưu kết luận hậu kiểm.', 'error');
     } finally {
       setSavingVerdict(false);
+    }
+  };
+
+  const handleExportViolations = async (format: 'xlsx' | 'csv') => {
+    if (!examId || exportingFormat) return;
+    setExportingFormat(format);
+    try {
+      const res = await examApi.exportViolationsFile(examId, format);
+      triggerBlobDownload(
+        res.data,
+        `nhat-ky-vi-pham-exam-${examId}.${format}`,
+        res.headers?.['content-disposition'],
+      );
+      showToast(
+        `Đã xuất báo cáo vi phạm định dạng ${format.toUpperCase()} thành công.`,
+        'success',
+      );
+    } catch {
+      showToast('Không thể xuất báo cáo vi phạm. Vui lòng thử lại.', 'error');
+    } finally {
+      setExportingFormat(null);
     }
   };
 
@@ -435,6 +482,22 @@ export const ExamViolationsPage: React.FC = () => {
         </header>
 
         <div className="exam-page-content" style={{ maxWidth: '100%' }}>
+          {toastNotice && (
+            <div
+              className={
+                toastNotice.tone === 'error' ? 'exam-error-banner' : 'monitor-toast-banner'
+              }
+              role="status"
+            >
+              {toastNotice.tone === 'error' ? (
+                <FiAlertTriangle size={16} />
+              ) : (
+                <FiCheckCircle size={16} />
+              )}
+              <span>{toastNotice.text}</span>
+            </div>
+          )}
+
           {/* Top Header */}
           <div className="violations-top-bar">
             <div className="v-top-left">
@@ -449,20 +512,44 @@ export const ExamViolationsPage: React.FC = () => {
               </div>
             </div>
 
-            <div className="v-top-actions" style={{ display: 'flex', gap: 10 }}>
+            <div className="v-top-actions" style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
               <button
                 type="button"
                 className="exam-btn exam-btn-secondary"
-                onClick={() => navigate(`/exam/${examId}/grading`)}
+                onClick={() =>
+                  navigate(
+                    selectedAttemptId
+                      ? `/exam/${examId}/grading?attemptId=${selectedAttemptId}`
+                      : `/exam/${examId}/grading`,
+                  )
+                }
               >
                 Chấm bài & Điểm số
               </button>
               <button
                 type="button"
                 className="exam-btn exam-btn-outline"
+                disabled={Boolean(exportingFormat)}
+                onClick={() => void handleExportViolations('csv')}
+              >
+                <FiDownload size={14} />{' '}
+                {exportingFormat === 'csv' ? 'Đang xuất...' : 'Xuất CSV'}
+              </button>
+              <button
+                type="button"
+                className="exam-btn exam-btn-outline"
+                disabled={Boolean(exportingFormat)}
+                onClick={() => void handleExportViolations('xlsx')}
+              >
+                <FiDownload size={14} />{' '}
+                {exportingFormat === 'xlsx' ? 'Đang xuất...' : 'Xuất Excel (.xlsx)'}
+              </button>
+              <button
+                type="button"
+                className="exam-btn exam-btn-outline"
                 onClick={() => window.print()}
               >
-                Xuất báo cáo PDF
+                In / PDF
               </button>
             </div>
           </div>

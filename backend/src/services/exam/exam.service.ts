@@ -133,6 +133,66 @@ export async function createBankQuestion(classId: number, lecturerId: number, in
   return getBankQuestion(questionId);
 }
 
+export async function importBankQuestions(
+  classId: number,
+  lecturerId: number,
+  rawItems: unknown,
+) {
+  if (!Array.isArray(rawItems) || rawItems.length === 0) {
+    throw new HttpError(400, 'Tệp JSON không chứa danh sách câu hỏi hợp lệ');
+  }
+  if (rawItems.length > 500) {
+    throw new HttpError(400, 'Mỗi lần nhập JSON tối đa 500 câu hỏi');
+  }
+
+  const normalizedList = rawItems.map((raw: any, index: number) => {
+    try {
+      return normalizeAndValidateQuestionPayload({
+        questionType: raw?.questionType ?? raw?.question_type ?? 'single_choice',
+        content: raw?.content ?? '',
+        explanation: raw?.explanation ?? null,
+        points: raw?.defaultPoints ?? raw?.default_points ?? raw?.points ?? 1,
+        difficulty: raw?.difficulty ?? 'medium',
+        chapter: raw?.chapter ?? null,
+        tags: Array.isArray(raw?.tags) ? raw.tags : [],
+        options: Array.isArray(raw?.options) ? raw.options : [],
+      });
+    } catch (err: any) {
+      const msg = err instanceof HttpError ? err.message : 'Dữ liệu không hợp lệ';
+      throw new HttpError(400, `Câu #${index + 1}: ${msg}`);
+    }
+  });
+
+  const createdIds = await withTransaction(async (client) => {
+    const ids: number[] = [];
+    for (const item of normalizedList) {
+      const q = await client.query(
+        `INSERT INTO bank_questions
+           (class_id, created_by, question_type, content, explanation, default_points, difficulty, chapter, tags)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         RETURNING id`,
+        [
+          classId,
+          lecturerId,
+          item.questionType,
+          item.content,
+          item.explanation,
+          item.points,
+          item.difficulty,
+          item.chapter,
+          item.tags,
+        ],
+      );
+      const createdId = q.rows[0].id as number;
+      await insertOptions(client, 'bank_question_options', 'question_id', createdId, item.options);
+      ids.push(createdId);
+    }
+    return ids;
+  });
+
+  return { importedCount: createdIds.length, ids: createdIds };
+}
+
 export async function updateBankQuestion(questionId: number, input: BankQuestionInput) {
   const normalized = normalizeAndValidateQuestionPayload({
     questionType: input.questionType,

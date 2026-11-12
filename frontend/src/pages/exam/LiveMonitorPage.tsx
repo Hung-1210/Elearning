@@ -24,6 +24,7 @@ import type { ClassInfo } from '../../types';
 import Sidebar from '../../components/layout/Sidebar';
 import { useLayoutStore } from '../../store/layoutStore';
 import { useAuthStore } from '../../store/authStore';
+import { formatSubmitReason } from './examUtils';
 import './exam.css';
 
 interface MonitorExamInfo {
@@ -115,7 +116,10 @@ export const LiveMonitorPage: React.FC = () => {
   const [warnTarget, setWarnTarget] = useState<CandidateFeed | null>(null);
   const [warnMessage, setWarnMessage] = useState('Vui lòng tập trung nhìn thẳng vào màn hình làm bài!');
   const [sendingWarn, setSendingWarn] = useState(false);
-  const [toastNotice, setToastNotice] = useState<string | null>(null);
+  const [toastNotice, setToastNotice] = useState<{
+    text: string;
+    tone: 'success' | 'error';
+  } | null>(null);
 
   const [aiStatusInfo, setAiStatusInfo] = useState<{
     ready: boolean;
@@ -132,11 +136,11 @@ export const LiveMonitorPage: React.FC = () => {
   soundEnabledRef.current = soundEnabled;
   const socketRef = useRef<Socket | null>(null);
 
-  const showToast = useCallback((msg: string) => {
-    setToastNotice(msg);
+  const showToast = useCallback((text: string, tone: 'success' | 'error' = 'success') => {
+    setToastNotice({ text, tone });
     window.setTimeout(() => {
-      setToastNotice((cur) => (cur === msg ? null : cur));
-    }, 3500);
+      setToastNotice((cur) => (cur?.text === text ? null : cur));
+    }, 4000);
   }, []);
 
   const playAlertBeep = useCallback((isCritical: boolean) => {
@@ -407,7 +411,7 @@ export const LiveMonitorPage: React.FC = () => {
       setBroadcastMessage('');
       setBroadcastModalOpen(false);
     } catch (err: any) {
-      alert(err.response?.data?.error || 'Không thể gửi thông báo tới phòng thi.');
+      showToast(err.response?.data?.error || 'Không thể gửi thông báo tới phòng thi.', 'error');
     } finally {
       setSendingBroadcast(false);
     }
@@ -421,7 +425,7 @@ export const LiveMonitorPage: React.FC = () => {
       showToast(`Đã gửi nhắc nhở trực tiếp tới ${warnTarget.student_name}.`);
       setWarnTarget(null);
     } catch (err: any) {
-      alert(err.response?.data?.error || 'Không thể gửi nhắc nhở.');
+      showToast(err.response?.data?.error || 'Không thể gửi nhắc nhở.', 'error');
     } finally {
       setSendingWarn(false);
     }
@@ -438,7 +442,7 @@ export const LiveMonitorPage: React.FC = () => {
       showToast(`Đã thu bài của thí sinh ${candidate.student_name}.`);
       void loadInitialData();
     } catch (err: any) {
-      alert(err.response?.data?.error || 'Không thể cưỡng chế nộp bài.');
+      showToast(err.response?.data?.error || 'Không thể cưỡng chế nộp bài.', 'error');
     }
   };
 
@@ -509,9 +513,18 @@ export const LiveMonitorPage: React.FC = () => {
 
         <div className="exam-page-content" style={{ maxWidth: '100%' }}>
           {toastNotice && (
-            <div className="monitor-toast-banner">
-              <FiCheckCircle size={16} />
-              <span>{toastNotice}</span>
+            <div
+              className={
+                toastNotice.tone === 'error' ? 'exam-error-banner' : 'monitor-toast-banner'
+              }
+              role="status"
+            >
+              {toastNotice.tone === 'error' ? (
+                <FiAlertTriangle size={16} />
+              ) : (
+                <FiCheckCircle size={16} />
+              )}
+              <span>{toastNotice.text}</span>
             </div>
           )}
 
@@ -722,6 +735,9 @@ export const LiveMonitorPage: React.FC = () => {
                                   <>
                                     <FiCheckCircle size={12} /> Hoàn thành lúc{' '}
                                     {c.submitted_at ? formatClock(c.submitted_at) : '--:--'}
+                                    {c.submit_reason && c.submit_reason !== 'manual'
+                                      ? ` (${formatSubmitReason(c.submit_reason, true)})`
+                                      : ''}
                                   </>
                                 ) : exam?.proctoring_enabled === false ? (
                                   <>
@@ -905,7 +921,7 @@ export const LiveMonitorPage: React.FC = () => {
                           <button
                             type="button"
                             className="alert-mini-link"
-                            onClick={() => navigate(`/exam/${examId}/violations`)}
+                            onClick={() => navigate(`/exam/${examId}/violations?attemptId=${al.attempt_id}`)}
                           >
                             Xem bằng chứng ›
                           </button>

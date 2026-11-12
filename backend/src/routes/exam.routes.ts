@@ -9,6 +9,7 @@ import {
 import * as examService from '../services/exam/exam.service.js';
 import * as attemptService from '../services/exam/attempt.service.js';
 import * as gradingService from '../services/exam/grading.service.js';
+import * as exportService from '../services/exam/export.service.js';
 import * as statsService from '../services/proctoring/stats.service.js';
 import {
   ingestFrame, ingestBrowserEvent, getIngestionMetrics, queueSupervisorNotice,
@@ -82,6 +83,27 @@ router.post('/classes/:classId/question-bank', requireLogin, requireLecturer, re
     ok(res, row, 201);
   } catch (err) { sendError(res, err); }
 });
+
+router.post(
+  '/classes/:classId/question-bank/import',
+  requireLogin,
+  requireLecturer,
+  requireClassOwnership,
+  rateLimit({ windowMs: 60_000, max: 15, key: (req) => `qb-import:${req.user?.userId}` }),
+  async (req, res) => {
+    try {
+      const items = Array.isArray(req.body) ? req.body : req.body?.questions;
+      const result = await examService.importBankQuestions(
+        Number(req.params.classId),
+        req.user!.userId,
+        items,
+      );
+      ok(res, result, 201);
+    } catch (err) {
+      sendError(res, err);
+    }
+  },
+);
 
 router.put('/question-bank/:id', requireLogin, requireLecturer, async (req, res) => {
   try {
@@ -289,6 +311,26 @@ router.get('/exams/:examId/violations', requireLogin, requireLecturer, requireEx
   catch (err) { sendError(res, err); }
 });
 
+router.get(
+  '/exams/:examId/violations/export',
+  requireLogin,
+  requireLecturer,
+  requireExamOwnership,
+  rateLimit({ windowMs: 60_000, max: 20, key: (req) => `export-viol:${req.user?.userId}` }),
+  async (req, res) => {
+    try {
+      const fmt = req.query.format === 'csv' ? 'csv' : 'xlsx';
+      const file = await exportService.buildViolationsExport(Number(req.params.examId), fmt);
+      res.setHeader('Content-Type', file.contentType);
+      res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.send(file.buffer);
+    } catch (err) {
+      sendError(res, err);
+    }
+  },
+);
+
 router.get('/attempts/:attemptId/behavior-stats', requireLogin, requireLecturer, requireAttemptExamOwnership, async (req, res) => {
   try { ok(res, await statsService.getAttemptBehaviorStats(Number(req.params.attemptId))); }
   catch (err) { sendError(res, err); }
@@ -374,6 +416,26 @@ router.get('/exams/:examId/grading', requireLogin, requireLecturer, requireExamO
   try { ok(res, await gradingService.listAttemptsForGrading(Number(req.params.examId))); }
   catch (err) { sendError(res, err); }
 });
+
+router.get(
+  '/exams/:examId/grading/export',
+  requireLogin,
+  requireLecturer,
+  requireExamOwnership,
+  rateLimit({ windowMs: 60_000, max: 20, key: (req) => `export-grade:${req.user?.userId}` }),
+  async (req, res) => {
+    try {
+      const fmt = req.query.format === 'csv' ? 'csv' : 'xlsx';
+      const file = await exportService.buildGradingExport(Number(req.params.examId), fmt);
+      res.setHeader('Content-Type', file.contentType);
+      res.setHeader('Content-Disposition', `attachment; filename="${file.filename}"`);
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.send(file.buffer);
+    } catch (err) {
+      sendError(res, err);
+    }
+  },
+);
 
 router.get('/attempts/:attemptId/grading', requireLogin, requireLecturer, requireAttemptExamOwnership, async (req, res) => {
   try { ok(res, await gradingService.getAttemptForGrading(Number(req.params.attemptId))); }
@@ -482,6 +544,47 @@ router.put('/attempts/:attemptId/answers/:questionId', requireLogin, requireStud
     ok(res, { saved: true });
   } catch (err) { sendError(res, err); }
 });
+
+router.post(
+  '/attempts/:attemptId/answers/:questionId/file',
+  requireLogin,
+  requireStudent,
+  requireAttemptOwner,
+  rateLimit({ windowMs: 60_000, max: 20, key: (req) => `ans-file:${req.params.attemptId}` }),
+  upload.single('file'),
+  async (req, res) => {
+    try {
+      if (!req.file) throw new HttpError(400, 'Vui lòng chọn tệp cần tải lên');
+      const result = await attemptService.uploadAnswerFile(
+        Number(req.params.attemptId),
+        Number(req.params.questionId),
+        req.file,
+      );
+      ok(res, result, 201);
+    } catch (err) { sendError(res, err); }
+  },
+);
+
+router.get(
+  '/attempts/:attemptId/answers/:questionId/file',
+  requireLogin,
+  async (req, res) => {
+    try {
+      const { buffer, fileName } = await attemptService.getAnswerFileForDownload(
+        Number(req.params.attemptId),
+        Number(req.params.questionId),
+        req.user!,
+      );
+      res.setHeader('Content-Type', 'application/octet-stream');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+      );
+      res.setHeader('Cache-Control', 'private, no-store');
+      res.send(buffer);
+    } catch (err) { sendError(res, err); }
+  },
+);
 
 router.post('/attempts/:attemptId/submit', requireLogin, requireStudent, requireAttemptOwner, async (req, res) => {
   try { ok(res, await attemptService.submitAttempt(Number(req.params.attemptId), 'manual')); }

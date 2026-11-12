@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { questionBankApi } from '../../api';
 import type { BankQuestion, BankQuestionOption } from '../../types';
 import './exam.css';
@@ -25,8 +25,11 @@ export function QuestionBankTab({ classId }: QuestionBankTabProps) {
   const [showModal, setShowModal] = useState(false);
   const [editingQuestion, setEditingQuestion] = useState<BankQuestion | null>(null);
   const [saving, setSaving] = useState(false);
+  const [importingJson, setImportingJson] = useState(false);
   const [modalError, setModalError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const [actionSuccess, setActionSuccess] = useState<string | null>(null);
+  const importFileInputRef = useRef<HTMLInputElement | null>(null);
   const [formData, setFormData] = useState({
     content: '',
     explanation: '',
@@ -256,6 +259,50 @@ export function QuestionBankTab({ classId }: QuestionBankTabProps) {
     URL.revokeObjectURL(url);
   };
 
+  const handleImportJsonFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file || importingJson) return;
+
+    setActionError(null);
+    setActionSuccess(null);
+
+    let parsed: any;
+    try {
+      const text = await file.text();
+      parsed = JSON.parse(text);
+    } catch {
+      setActionError('Tệp tải lên không phải là định dạng JSON hợp lệ.');
+      return;
+    }
+
+    const rawQuestions = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed?.questions)
+        ? parsed.questions
+        : null;
+
+    if (!rawQuestions || rawQuestions.length === 0) {
+      setActionError('Không tìm thấy mảng câu hỏi hợp lệ trong tệp JSON.');
+      return;
+    }
+
+    setImportingJson(true);
+    try {
+      const res = await questionBankApi.importBulk(numericClassId, rawQuestions);
+      const count = res.data?.data?.importedCount ?? rawQuestions.length;
+      setActionSuccess(`Đã nhập thành công ${count} câu hỏi vào ngân hàng câu hỏi của lớp.`);
+      window.setTimeout(() => setActionSuccess(null), 5000);
+      await loadQuestions();
+    } catch (err: any) {
+      setActionError(
+        err.response?.data?.error || 'Không thể nhập câu hỏi từ tệp JSON. Vui lòng kiểm tra cấu trúc tệp.',
+      );
+    } finally {
+      setImportingJson(false);
+    }
+  };
+
   return (
     <div style={{ marginTop: 16 }}>
       {/* ── Header Title & Actions (image1.png) ── */}
@@ -292,7 +339,34 @@ export function QuestionBankTab({ classId }: QuestionBankTabProps) {
           </p>
         </div>
 
-        <div style={{ display: 'flex', gap: 10 }}>
+        <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap' }}>
+          <input
+            ref={importFileInputRef}
+            type="file"
+            accept=".json,application/json"
+            style={{ display: 'none' }}
+            onChange={(e) => void handleImportJsonFile(e)}
+          />
+          <button
+            type="button"
+            onClick={() => importFileInputRef.current?.click()}
+            disabled={importingJson}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              padding: '10px 16px',
+              background: '#FFFFFF',
+              border: '1px solid #CBD5E1',
+              borderRadius: 10,
+              fontSize: 14,
+              fontWeight: 600,
+              color: '#334155',
+              cursor: importingJson ? 'not-allowed' : 'pointer',
+            }}
+          >
+            <span>📤</span> {importingJson ? 'Đang nhập...' : 'Nhập JSON'}
+          </button>
           <button
             type="button"
             onClick={handleExportJson}
@@ -344,6 +418,12 @@ export function QuestionBankTab({ classId }: QuestionBankTabProps) {
           >
             Thử lại
           </button>
+        </div>
+      )}
+
+      {actionSuccess && (
+        <div className="monitor-toast-banner" role="status" style={{ marginBottom: 16 }}>
+          <span>✓ {actionSuccess}</span>
         </div>
       )}
 

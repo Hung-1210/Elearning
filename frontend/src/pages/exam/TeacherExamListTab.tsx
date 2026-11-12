@@ -22,6 +22,7 @@ import {
 } from 'react-icons/fi';
 import { examApi } from '../../api';
 import type { Exam } from '../../types';
+import { toLocalDatetimeInputValue } from './examUtils';
 import './exam.css';
 
 interface TeacherExamListTabProps {
@@ -35,6 +36,14 @@ export const TeacherExamListTab: React.FC<TeacherExamListTabProps> = ({ classId 
   const [filterStatus, setFilterStatus] = useState<string>('all');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [openMenuId, setOpenMenuId] = useState<string | number | null>(null);
+  const [noticeBanner, setNoticeBanner] = useState<{
+    text: string;
+    tone: 'success' | 'error';
+  } | null>(null);
+  const [reopenTarget, setReopenTarget] = useState<Exam | null>(null);
+  const [reopenEndTime, setReopenEndTime] = useState<string>('');
+  const [reopenError, setReopenError] = useState<string | null>(null);
+  const [reopenSaving, setReopenSaving] = useState<boolean>(false);
   const [aiGuardStatus, setAiGuardStatus] = useState<{
     ready: boolean;
     p50Ms: number | null;
@@ -75,6 +84,13 @@ export const TeacherExamListTab: React.FC<TeacherExamListTabProps> = ({ classId 
     }
   };
 
+  const showNotice = (text: string, tone: 'success' | 'error' = 'success') => {
+    setNoticeBanner({ text, tone });
+    window.setTimeout(() => {
+      setNoticeBanner((cur) => (cur?.text === text ? null : cur));
+    }, 4500);
+  };
+
   const handleDelete = async (id: string | number, e: React.MouseEvent) => {
     e.stopPropagation();
     setOpenMenuId(null);
@@ -82,8 +98,12 @@ export const TeacherExamListTab: React.FC<TeacherExamListTabProps> = ({ classId 
       try {
         await examApi.delete(id);
         setExams((current) => current.filter((ex) => String(ex.id) !== String(id)));
+        showNotice('Đã xóa đề thi khỏi danh sách lớp.', 'success');
       } catch (err: any) {
-        alert(err.response?.data?.error || err.response?.data?.message || 'Không thể xóa kỳ thi.');
+        showNotice(
+          err.response?.data?.error || err.response?.data?.message || 'Không thể xóa kỳ thi.',
+          'error',
+        );
       }
     }
   };
@@ -97,41 +117,55 @@ export const TeacherExamListTab: React.FC<TeacherExamListTabProps> = ({ classId 
       setExams((current) =>
         current.map((item) => (String(item.id) === String(exam.id) ? res.data.data : item)),
       );
+      showNotice('Đã đóng đề thi thành công.', 'success');
     } catch (err: any) {
-      alert(err.response?.data?.error || err.response?.data?.message || 'Không thể đóng đề thi.');
+      showNotice(
+        err.response?.data?.error || err.response?.data?.message || 'Không thể đóng đề thi.',
+        'error',
+      );
     }
   };
 
-  const handleReopen = async (exam: Exam, e: React.MouseEvent) => {
+  const handleReopen = (exam: Exam, e: React.MouseEvent) => {
     e.stopPropagation();
     setOpenMenuId(null);
-    const defaultEndTime = new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 16);
-    const endTimeInput = window.prompt(
-      'Nhập thời gian kết thúc mới (YYYY-MM-DDTHH:mm):',
-      defaultEndTime,
-    );
-    if (!endTimeInput) return;
+    setReopenTarget(exam);
+    setReopenError(null);
+    setReopenEndTime(toLocalDatetimeInputValue(new Date(Date.now() + 60 * 60 * 1000)));
+  };
 
-    const endTime = new Date(endTimeInput);
-    if (Number.isNaN(endTime.getTime()) || endTime <= new Date()) {
-      alert('Thời gian kết thúc mới phải là thời điểm hợp lệ trong tương lai.');
+  const handleConfirmReopen = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!reopenTarget || reopenSaving) return;
+    setReopenError(null);
+
+    const endTime = new Date(reopenEndTime);
+    if (!reopenEndTime || Number.isNaN(endTime.getTime()) || endTime <= new Date()) {
+      setReopenError('Thời gian kết thúc mới phải là một thời điểm hợp lệ trong tương lai.');
       return;
     }
-    const startTime = new Date(exam.start_time);
+    const startTime = new Date(reopenTarget.start_time);
     if (endTime <= startTime) {
-      alert('Thời gian kết thúc mới phải sau thời gian bắt đầu đề.');
+      setReopenError('Thời gian kết thúc mới phải sau thời gian bắt đầu của đề thi.');
       return;
     }
 
+    setReopenSaving(true);
     try {
-      const res = await examApi.update(exam.id, {
+      const res = await examApi.update(reopenTarget.id, {
         endTime: endTime.toISOString(),
       } as Partial<Exam>);
       setExams((current) =>
-        current.map((item) => (String(item.id) === String(exam.id) ? res.data.data : item)),
+        current.map((item) => (String(item.id) === String(reopenTarget.id) ? res.data.data : item)),
       );
+      setReopenTarget(null);
+      showNotice(`Đã mở lại đề thi "${reopenTarget.title || reopenTarget.name}".`, 'success');
     } catch (err: any) {
-      alert(err.response?.data?.error || err.response?.data?.message || 'Không thể mở lại đề thi.');
+      setReopenError(
+        err.response?.data?.error || err.response?.data?.message || 'Không thể mở lại đề thi.',
+      );
+    } finally {
+      setReopenSaving(false);
     }
   };
 
@@ -247,6 +281,21 @@ export const TeacherExamListTab: React.FC<TeacherExamListTabProps> = ({ classId 
 
   return (
     <div className="exam-page-content" style={{ padding: '16px 0 36px' }}>
+      {noticeBanner && (
+        <div
+          className={noticeBanner.tone === 'error' ? 'exam-error-banner' : 'monitor-toast-banner'}
+          role="status"
+          style={{ marginBottom: 16 }}
+        >
+          {noticeBanner.tone === 'error' ? (
+            <FiAlertTriangle size={16} />
+          ) : (
+            <FiCheckCircle size={16} />
+          )}
+          <span>{noticeBanner.text}</span>
+        </div>
+      )}
+
       {/* ── Top Header Row (Matching image6.png) ── */}
       <div className="exam-header-row">
         <div className="exam-header-titles">
@@ -709,6 +758,122 @@ export const TeacherExamListTab: React.FC<TeacherExamListTabProps> = ({ classId 
           </button>
         </div>
       </div>
+
+      {/* ── Modal Mở lại / Gia hạn thời gian đóng đề thi ── */}
+      {reopenTarget && (
+        <div className="exam-modal-overlay" onClick={() => !reopenSaving && setReopenTarget(null)}>
+          <div
+            className="exam-modal-container"
+            style={{ maxWidth: 480, padding: 24 }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 style={{ fontSize: 18, fontWeight: 700, color: '#0F172A', margin: '0 0 8px' }}>
+              Mở lại / Gia hạn đề thi
+            </h3>
+            <p style={{ fontSize: 13, color: '#64748B', margin: '0 0 16px', lineHeight: 1.5 }}>
+              Chọn thời điểm đóng đề mới cho <strong>{reopenTarget.title || reopenTarget.name}</strong>. Sinh viên còn lượt thi sẽ có thể tiếp tục vào làm bài.
+            </p>
+
+            <form onSubmit={(e) => void handleConfirmReopen(e)}>
+              {reopenError && (
+                <div
+                  role="alert"
+                  style={{
+                    background: '#FEF2F2',
+                    border: '1px solid #FECACA',
+                    color: '#DC2626',
+                    padding: '10px 12px',
+                    borderRadius: 8,
+                    fontSize: 13,
+                    marginBottom: 14,
+                  }}
+                >
+                  {reopenError}
+                </div>
+              )}
+
+              <label
+                style={{
+                  display: 'block',
+                  fontSize: 13,
+                  fontWeight: 600,
+                  color: '#334155',
+                  marginBottom: 6,
+                }}
+              >
+                Thời điểm đóng đề mới
+              </label>
+              <input
+                type="datetime-local"
+                value={reopenEndTime}
+                onChange={(e) => {
+                  setReopenError(null);
+                  setReopenEndTime(e.target.value);
+                }}
+                style={{
+                  width: '100%',
+                  padding: '10px 12px',
+                  border: '1px solid #CBD5E1',
+                  borderRadius: 8,
+                  fontSize: 14,
+                  marginBottom: 10,
+                }}
+                required
+              />
+
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 20 }}>
+                {[
+                  { label: '+30 phút', mins: 30 },
+                  { label: '+1 giờ', mins: 60 },
+                  { label: '+2 giờ', mins: 120 },
+                  { label: '+1 ngày', mins: 24 * 60 },
+                ].map((preset) => (
+                  <button
+                    key={preset.mins}
+                    type="button"
+                    onClick={() => {
+                      setReopenError(null);
+                      setReopenEndTime(
+                        toLocalDatetimeInputValue(new Date(Date.now() + preset.mins * 60 * 1000)),
+                      );
+                    }}
+                    style={{
+                      fontSize: 12,
+                      fontWeight: 600,
+                      padding: '5px 10px',
+                      borderRadius: 6,
+                      border: '1px solid #E2E8F0',
+                      background: '#F8FAFC',
+                      color: '#334155',
+                      cursor: 'pointer',
+                    }}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
+                <button
+                  type="button"
+                  className="exam-btn exam-btn-secondary"
+                  disabled={reopenSaving}
+                  onClick={() => setReopenTarget(null)}
+                >
+                  Hủy bỏ
+                </button>
+                <button
+                  type="submit"
+                  className="exam-btn exam-btn-primary"
+                  disabled={reopenSaving}
+                >
+                  {reopenSaving ? 'Đang cập nhật...' : 'Xác nhận mở lại'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

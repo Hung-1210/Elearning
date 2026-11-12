@@ -24,10 +24,14 @@ import {
   FiX,
   FiList,
   FiCamera,
+  FiUpload,
+  FiDownload,
+  FiPaperclip,
 } from 'react-icons/fi';
 import { studentExamApi, BACKEND_ORIGIN } from '../../api';
 import { useAuthStore } from '../../store/authStore';
 import type { ExamAttempt, ExamQuestion } from '../../types';
+import { extractAnswerFileName, triggerBlobDownload } from './examUtils';
 import './exam.css';
 
 interface ExamQuestionItem {
@@ -48,6 +52,7 @@ interface ExamQuestionItem {
 type AnswerDraft = {
   selected_option_ids?: string[];
   answer_text?: string;
+  file_path?: string;
   is_flagged?: boolean;
 };
 
@@ -163,6 +168,8 @@ export const ExamTakingPage: React.FC = () => {
   const [aiStatus, setAiStatus] = useState<AiRuntimeStatus>('connecting');
   const [lastInferenceMs, setLastInferenceMs] = useState<number | null>(null);
   const frameInFlightRef = useRef(false);
+  const [uploadingFileQId, setUploadingFileQId] = useState<string | null>(null);
+  const answerFileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Proctoring Camera Feed
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -239,8 +246,11 @@ export const ExamTakingPage: React.FC = () => {
     socket.on('force-submitted', (payload: { message?: string }) => {
       stopWebcam();
       if (frameIntervalRef.current) clearInterval(frameIntervalRef.current);
-      alert(payload?.message || 'Giám thị đã thu bài thi của bạn.');
-      navigate(`/exam/${examId}/result/${attemptId}`);
+      navigate(`/exam/${examId}/result/${attemptId}`, {
+        state: {
+          forceSubmitNotice: payload?.message || 'Giám thị đã thu bài thi của bạn.',
+        },
+      });
     });
     sessionSocketRef.current = socket;
   };
@@ -392,6 +402,7 @@ export const ExamTakingPage: React.FC = () => {
           initialAnswers[String(question.id)] = {
             selected_option_ids: question.answer.selected_option_ids?.map(String),
             answer_text: question.answer.text_answer ?? undefined,
+            file_path: (question.answer as any).file_path ?? undefined,
           };
           if (question.answer.is_flagged) {
             initialFlags[String(question.id)] = true;
@@ -657,6 +668,44 @@ export const ExamTakingPage: React.FC = () => {
     }
   };
 
+  const handleUploadAnswerFile = async (questionId: string, file?: File | null) => {
+    if (!file || !attemptId || !canEditAttempt()) return;
+    setUploadingFileQId(questionId);
+    setQuestionSaveState(questionId, { status: 'saving' });
+    setProctoringError(null);
+    try {
+      const res = await studentExamApi.uploadAnswerFile(attemptId, questionId, file);
+      const uploadedPath = res.data.data.filePath;
+      setAnswersMap((prev) => ({
+        ...prev,
+        [questionId]: {
+          ...prev[questionId],
+          file_path: uploadedPath,
+        },
+      }));
+      setQuestionSaveState(questionId, { status: 'saved' });
+      setLastSavedAt(new Date().toLocaleTimeString('vi-VN'));
+    } catch (err: any) {
+      setQuestionSaveState(questionId, { status: 'error', message: 'Tải tệp lỗi' });
+      setProctoringError(
+        err.response?.data?.error || 'Không thể tải tệp bài làm lên máy chủ. Vui lòng kiểm tra định dạng hoặc dung lượng tệp.',
+      );
+    } finally {
+      setUploadingFileQId(null);
+    }
+  };
+
+  const handleDownloadAnswerFile = async (questionId: string, filePath?: string) => {
+    if (!attemptId || !filePath) return;
+    try {
+      const res = await studentExamApi.downloadAnswerFile(attemptId, questionId);
+      const disposition = (res.headers as Record<string, string | undefined>)?.['content-disposition'];
+      triggerBlobDownload(res.data, extractAnswerFileName(filePath) || `bai-lam-cau-${questionId}`, disposition);
+    } catch (err: any) {
+      setProctoringError(err.response?.data?.error || 'Không thể tải tệp đính kèm xuống.');
+    }
+  };
+
   const toggleFlag = (questionId: string) => {
     if (!canEditAttempt()) return;
     const nextVal = !flaggedQuestions[questionId];
@@ -738,7 +787,8 @@ export const ExamTakingPage: React.FC = () => {
     const a = answersMap[qId];
     return Boolean(
       (a?.selected_option_ids && a.selected_option_ids.length > 0) ||
-        (a?.answer_text && a.answer_text.trim().length > 0),
+        (a?.answer_text && a.answer_text.trim().length > 0) ||
+        Boolean(a?.file_path),
     );
   };
 
@@ -1049,14 +1099,70 @@ export const ExamTakingPage: React.FC = () => {
                       </div>
                     ) : currentQ.type === 'code' ? (
                       <div className="et-editor-box is-code">
-                        <div className="et-editor-header">
-                          <FiCode size={15} />
-                          <span>Trình soạn thảo mã nguồn / Lời giải kỹ thuật</span>
+                        <div
+                          className="et-editor-header"
+                          style={{ justifyContent: 'space-between', flexWrap: 'wrap', gap: 10 }}
+                        >
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                            <FiCode size={15} />
+                            <span>Nộp tệp bài làm / Trình soạn thảo mã nguồn</span>
+                          </div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                            <input
+                              ref={answerFileInputRef}
+                              type="file"
+                              accept=".pdf,.doc,.docx,.txt,.md,.rtf,.csv,.json,.xml,.sql,.py,.ipynb,.js,.ts,.tsx,.jsx,.java,.c,.cpp,.cc,.h,.hpp,.cs,.go,.rs,.php,.rb,.html,.css,.zip,.rar,.7z,.tar,.gz,.png,.jpg,.jpeg"
+                              style={{ display: 'none' }}
+                              onChange={(e) => {
+                                const file = e.target.files?.[0];
+                                e.target.value = '';
+                                if (file) void handleUploadAnswerFile(currentQ.id, file);
+                              }}
+                            />
+                            <button
+                              type="button"
+                              className="et-btn-temp-save"
+                              style={{ padding: '5px 12px', fontSize: 12 }}
+                              disabled={!canEditAttempt() || uploadingFileQId === currentQ.id}
+                              onClick={() => answerFileInputRef.current?.click()}
+                            >
+                              <FiUpload size={13} style={{ marginRight: 5 }} />
+                              {uploadingFileQId === currentQ.id
+                                ? 'Đang tải tệp...'
+                                : answersMap[currentQ.id]?.file_path
+                                  ? 'Thay thế tệp đính kèm'
+                                  : 'Đính kèm tệp (.zip, .pdf, .py, .cpp...)'}
+                            </button>
+                            {answersMap[currentQ.id]?.file_path && (
+                              <button
+                                type="button"
+                                className="et-save-chip is-saved"
+                                style={{
+                                  cursor: 'pointer',
+                                  border: '1px solid rgba(16, 185, 129, 0.35)',
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  gap: 5,
+                                }}
+                                onClick={() =>
+                                  void handleDownloadAnswerFile(
+                                    currentQ.id,
+                                    answersMap[currentQ.id]?.file_path,
+                                  )
+                                }
+                                title="Bấm để tải xuống tệp đã đính kèm"
+                              >
+                                <FiPaperclip size={12} />
+                                <span>{extractAnswerFileName(answersMap[currentQ.id]?.file_path)}</span>
+                                <FiDownload size={12} />
+                              </button>
+                            )}
+                          </div>
                         </div>
                         <textarea
                           rows={12}
                           className="et-code-textarea"
-                          placeholder="// Nhập mã nguồn hoặc lời giải kỹ thuật của bạn tại đây..."
+                          placeholder="// Nhập mã nguồn, ghi chú hướng dẫn chạy chương trình hoặc lời giải kỹ thuật tại đây (có thể kết hợp đính kèm tệp phía trên)..."
                           value={answersMap[currentQ.id]?.answer_text || ''}
                           onChange={(e) => handleTextAnswerChange(currentQ.id, e.target.value)}
                           onBlur={() => handleBlurSaveText(currentQ.id)}

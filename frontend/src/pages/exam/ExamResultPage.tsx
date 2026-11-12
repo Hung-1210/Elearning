@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useNavigate, useParams, useLocation } from 'react-router-dom';
 import {
   FiCheckCircle,
   FiClock,
@@ -13,8 +13,11 @@ import {
   FiFlag,
   FiBookOpen,
   FiAlertCircle,
+  FiPaperclip,
+  FiXCircle,
 } from 'react-icons/fi';
 import { studentExamApi } from '../../api';
+import { extractAnswerFileName, formatSubmitReason, triggerBlobDownload } from './examUtils';
 import './exam.css';
 
 interface ResultState {
@@ -51,6 +54,8 @@ interface ResultState {
 export const ExamResultPage: React.FC = () => {
   const { attemptId } = useParams<{ examId: string; attemptId: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
+  const forceSubmitNotice = (location.state as { forceSubmitNotice?: string } | null)?.forceSubmitNotice ?? null;
   const [resultData, setResultData] = useState<ResultState | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -146,14 +151,7 @@ export const ExamResultPage: React.FC = () => {
       ? resultData.score >= resultData.maxScore * 0.5
       : false;
 
-  const submitReasonText =
-    resultData.submitReason === 'timeout'
-      ? 'Tự động nộp khi hết thời gian'
-      : resultData.submitReason === 'violation_threshold'
-        ? 'Tự động nộp do vượt ngưỡng vi phạm AI'
-        : resultData.submitReason === 'lecturer_force'
-          ? 'Giảng viên thu bài trực tiếp'
-          : 'Thí sinh chủ động nộp bài';
+  const submitReasonText = formatSubmitReason(resultData.submitReason);
 
   const handleBackToClass = () => {
     if (resultData.classId) {
@@ -163,8 +161,32 @@ export const ExamResultPage: React.FC = () => {
     }
   };
 
+  const handleDownloadAnswerFile = async (questionId: number | string, filePath?: string | null) => {
+    if (!attemptId || !filePath) return;
+    try {
+      const res = await studentExamApi.downloadAnswerFile(attemptId, questionId);
+      const disposition = (res.headers as Record<string, string | undefined>)?.['content-disposition'];
+      triggerBlobDownload(res.data, extractAnswerFileName(filePath) || `bai-nop-cau-${questionId}`, disposition);
+    } catch {
+      // ignore or silent if file missing
+    }
+  };
+
   return (
     <div className="exam-result-page-container">
+      {forceSubmitNotice && (
+        <div
+          className="exam-error-banner"
+          role="status"
+          style={{ marginBottom: 16, justifyContent: 'flex-start', gap: 10 }}
+        >
+          <FiAlertCircle size={18} />
+          <span>
+            <strong>Thông báo từ Giám thị phòng thi:</strong> {forceSubmitNotice}
+          </span>
+        </div>
+      )}
+
       {/* Top Green Submission Confirmation Card (Matching image15.png) */}
       <div className="result-submission-banner">
         <div className="sub-banner-left">
@@ -319,22 +341,95 @@ export const ExamResultPage: React.FC = () => {
                 <FiBookOpen className="subhead-icon" /> Chi tiết bài làm của bạn
               </h4>
               <div style={{ display: 'grid', gap: 12 }}>
-                {resultData.questions.map((q: any, idx: number) => (
-                  <div key={q.id || idx} className="review-q-mini-card">
-                    <div className="rq-top">
-                      <strong>Câu {idx + 1}:</strong>
-                      <span className="points-pill-badge">
-                        {q.answer?.score ?? 0} / {q.points}đ
-                      </span>
-                    </div>
-                    <p className="rq-text">{q.content}</p>
-                    {q.answer?.grader_comment && (
-                      <div className="rubric-hint-box">
-                        <strong>Nhận xét giảng viên:</strong> {q.answer.grader_comment}
+                {resultData.questions.map((q: any, idx: number) => {
+                  const selectedIds: number[] = Array.isArray(q.answer?.selected_option_ids)
+                    ? q.answer.selected_option_ids.map(Number)
+                    : [];
+                  const isObjective =
+                    q.question_type === 'single_choice' || q.question_type === 'multiple_choice';
+
+                  return (
+                    <div key={q.id || idx} className="review-q-mini-card">
+                      <div className="rq-top">
+                        <strong>Câu {idx + 1}:</strong>
+                        <span className="points-pill-badge">
+                          {q.answer?.score ?? 0} / {q.points}đ
+                        </span>
                       </div>
-                    )}
-                  </div>
-                ))}
+                      <p className="rq-text">{q.content}</p>
+
+                      {isObjective && Array.isArray(q.options) && q.options.length > 0 && (
+                        <div className="g-options-list" style={{ marginTop: 8 }}>
+                          {q.options.map((opt: any) => {
+                            const isPicked = selectedIds.includes(Number(opt.id));
+                            const isCorrect = Boolean(opt.is_correct);
+                            let optClass = 'opt-row';
+                            if (isCorrect) optClass += ' correct-opt';
+                            if (isPicked && !isCorrect) optClass += ' student-wrong-opt';
+                            return (
+                              <div key={opt.id} className={optClass}>
+                                <div className="opt-marker">
+                                  {isCorrect ? (
+                                    <FiCheckCircle color="#059669" />
+                                  ) : isPicked ? (
+                                    <FiXCircle color="#DC2626" />
+                                  ) : (
+                                    <div className="circle-dot" />
+                                  )}
+                                </div>
+                                <span className="opt-text">{opt.content}</span>
+                                {isPicked && <span className="student-picked-tag">Bạn đã chọn</span>}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
+                      {!isObjective && (
+                        <div style={{ marginTop: 8 }}>
+                          {q.answer?.file_path && (
+                            <div style={{ marginBottom: 8 }}>
+                              <button
+                                type="button"
+                                className="exam-btn exam-btn-outline"
+                                style={{ padding: '5px 12px', fontSize: 12 }}
+                                onClick={() => void handleDownloadAnswerFile(q.id, q.answer.file_path)}
+                              >
+                                <FiPaperclip size={13} /> Tải tệp đã nộp (
+                                {extractAnswerFileName(q.answer.file_path)})
+                              </button>
+                            </div>
+                          )}
+                          {(q.answer?.text_answer || !q.answer?.file_path) && (
+                            <div
+                              className={`student-submission-box ${
+                                q.question_type === 'file_upload' ? 'code-font' : ''
+                              }`}
+                            >
+                              <pre>
+                                {q.answer?.text_answer?.trim()
+                                  ? q.answer.text_answer
+                                  : '(Bạn đã bỏ trống nội dung văn bản ở câu hỏi này)'}
+                              </pre>
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {q.explanation && (
+                        <div className="rubric-hint-box" style={{ marginTop: 8 }}>
+                          <strong>Giải thích / Đáp án mẫu:</strong> {q.explanation}
+                        </div>
+                      )}
+
+                      {q.answer?.grader_comment && (
+                        <div className="rubric-hint-box" style={{ marginTop: 8 }}>
+                          <strong>Nhận xét giảng viên:</strong> {q.answer.grader_comment}
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}

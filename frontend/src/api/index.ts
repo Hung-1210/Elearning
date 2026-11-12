@@ -139,6 +139,11 @@ export const questionBankApi = {
   update: (id: number, data: Partial<import('../types').BankQuestion>) =>
     api.put<{ success: boolean; data: import('../types').BankQuestion }>(`/question-bank/${id}`, data),
   delete: (id: number) => api.delete(`/question-bank/${id}`),
+  importBulk: (classId: number, questions: any[]) =>
+    api.post<{ success: boolean; data: { importedCount: number; ids: number[] } }>(
+      `/classes/${classId}/question-bank/import`,
+      { questions },
+    ),
 };
 
 // ── Exam & Proctoring (Lecturer) ──────────────────────────────
@@ -236,6 +241,11 @@ export const examApi = {
     api.get<Blob>(`/attempts/${attemptId}/evidence/${evidenceId}`, { responseType: 'blob' }),
   getViolations: (examId: number | string, onlyFlagged = false) =>
     api.get<{ success: boolean; data: { exam: any; violations: any[]; analytics: any } }>(`/exams/${examId}/violations`, { params: { onlyFlagged } }),
+  exportViolationsFile: (examId: number | string, format: 'xlsx' | 'csv' = 'xlsx') =>
+    api.get<Blob>(`/exams/${examId}/violations/export`, {
+      params: { format },
+      responseType: 'blob',
+    }),
   getBehaviorStats: (attemptId: number | string) =>
     api.get<{ success: boolean; data: import('../types').BehaviorStat[] }>(`/attempts/${attemptId}/behavior-stats`),
   getTimeline: (attemptId: number | string) =>
@@ -258,6 +268,15 @@ export const examApi = {
     api.put(`/attempts/${attemptId}/grading/${questionId}`, { score, comment }),
   gradeAttempt: (attemptId: number | string, payload: any) =>
     api.put(`/attempts/${attemptId}/grading`, payload),
+  exportGradingFile: (examId: number | string, format: 'xlsx' | 'csv' = 'xlsx') =>
+    api.get<Blob>(`/exams/${examId}/grading/export`, {
+      params: { format },
+      responseType: 'blob',
+    }),
+  downloadAnswerFile: (attemptId: number | string, questionId: number | string) =>
+    api.get<Blob>(`/attempts/${attemptId}/answers/${questionId}/file`, {
+      responseType: 'blob',
+    }),
 };
 
 // ── Student Exam Taking & Proctoring ──────────────────────────
@@ -304,6 +323,18 @@ export const studentExamApi = {
     }
     return api.put(`/attempts/${attemptId}/answers/${questionIdOrData}`, maybeData);
   },
+  uploadAnswerFile: (attemptId: number | string, questionId: number | string, file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return api.post<{
+      success: boolean;
+      data: { filePath: string; fileName: string; sizeBytes: number };
+    }>(`/attempts/${attemptId}/answers/${questionId}/file`, formData);
+  },
+  downloadAnswerFile: (attemptId: number | string, questionId: number | string) =>
+    api.get<Blob>(`/attempts/${attemptId}/answers/${questionId}/file`, {
+      responseType: 'blob',
+    }),
   submitAttempt: (attemptId: number | string) =>
     api.post<{ success: boolean; data: import('../types').ExamAttempt }>(`/attempts/${attemptId}/submit`),
   reportBrowserEvent: (

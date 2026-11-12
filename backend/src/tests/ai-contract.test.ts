@@ -112,6 +112,8 @@ let client: typeof import('../services/proctoring/ai-client.js');
 let policy: typeof import('../services/proctoring/policy.js');
 let visibility: typeof import('../services/exam/visibility.js');
 let examService: typeof import('../services/exam/exam.service.js');
+let exportService: typeof import('../services/exam/export.service.js');
+let storageService: typeof import('../services/proctoring/storage.js');
 let db: typeof import('../config/database.js');
 let settings: ReturnType<typeof import('../services/proctoring/policy.js').resolveProctoringSettings>;
 const run = { face: true, headPose: true, gaze: false, objects: true, identity: true };
@@ -127,6 +129,8 @@ before(async () => {
   policy = await import('../services/proctoring/policy.js');
   visibility = await import('../services/exam/visibility.js');
   examService = await import('../services/exam/exam.service.js');
+  exportService = await import('../services/exam/export.service.js');
+  storageService = await import('../services/proctoring/storage.js');
   db = await import('../config/database.js');
   client.setFetchImplForTest(mockFetch);
   settings = policy.resolveProctoringSettings({
@@ -558,7 +562,82 @@ test('QuestionBank: createBankQuestion & updateBankQuestion COMMIT trước khi 
     });
     assert.equal(updated.question_type, 'multiple_choice');
     assert.equal(updated.options.length, 3);
+
+    // 3. Nhập hàng loạt từ JSON xuất ra (snake_case)
+    const imported = await examService.importBankQuestions(1, 2, [
+      {
+        question_type: 'essay',
+        content: 'Câu tự luận nhập từ JSON',
+        default_points: 1.5,
+        difficulty: 'hard',
+      },
+      {
+        question_type: 'single_choice',
+        content: 'HTTP mặc định dùng cổng nào?',
+        default_points: 1,
+        options: [
+          { content: '80', is_correct: true },
+          { content: '443', is_correct: false },
+        ],
+      },
+    ]);
+    assert.equal(imported.importedCount, 2);
+
+    // 4. Báo lỗi chính xác số thứ tự câu nếu JSON lỗi
+    await assert.rejects(
+      () =>
+        examService.importBankQuestions(1, 2, [
+          { question_type: 'essay', content: 'Hợp lệ' },
+          { question_type: 'single_choice', content: 'Thiếu đáp án', options: [] },
+        ]),
+      /Câu #2:/,
+    );
   } finally {
     (db.pool as any).connect = origConnect;
   }
+});
+
+test('Export & SubmitReason: map đúng 4 mã submit_reason và chống CSV formula injection + kèm UTF-8 BOM', () => {
+  assert.equal(exportService.formatSubmitReasonVi('time_up'), 'Tự động nộp khi hết thời gian');
+  assert.equal(exportService.formatSubmitReasonVi('proctoring'), 'Tự động nộp do vượt ngưỡng vi phạm AI');
+  assert.equal(exportService.formatSubmitReasonVi('lecturer'), 'Giảng viên thu bài trực tiếp');
+  assert.equal(exportService.formatSubmitReasonVi('manual'), 'Thí sinh chủ động nộp bài');
+
+  const csvBuf = exportService.toCsvBuffer([
+    ['Mã SV', 'Ghi chú'],
+    ['SV01', '=HYPERLINK("http://evil")'],
+    ['SV02', 'Có dấu phẩy, và "ngoặc kép"'],
+  ]);
+  const text = csvBuf.toString('utf8');
+  assert.equal(text.startsWith('\uFEFF'), true, 'Phải có UTF-8 BOM cho Excel');
+  assert.ok(text.includes("'=HYPERLINK"), 'Phải escape ký tự công thức =');
+  assert.ok(text.includes('"Có dấu phẩy, và ""ngoặc kép"""'));
+});
+
+test('Answer File Storage: lọc đuôi file, làm sạch tên file, lưu/đọc/xóa và chống path traversal', async () => {
+  // 1. Chặn định dạng nguy hiểm (.exe, .bat, không có đuôi)
+  assert.throws(() => storageService.sanitizeAnswerFileName('malware.exe'), /không được hỗ trợ/);
+  assert.throws(() => storageService.sanitizeAnswerFileName('README'), /không được hỗ trợ/);
+
+  // 2. Làm sạch tên file tiếng Việt & ký tự lạ
+  const clean = storageService.sanitizeAnswerFileName('../../Bài tập_1 (Final).py');
+  assert.equal(clean.ext, '.py');
+  assert.equal(clean.safeName, 'Bài_tập_1_Final_.py');
+
+  // 3. Lưu, đọc lại và xóa file bài làm thật trong private-uploads/answer-files
+  const payload = Buffer.from('def solve():\n    return 42\n', 'utf8');
+  const saved = await storageService.saveAttemptAnswerFile(999999, 12, 'solution.py', payload);
+  try {
+    assert.ok(saved.relPath.startsWith('answer-files/999999/'));
+    assert.equal(storageService.extractOriginalAnswerFileName(saved.relPath), 'solution.py');
+
+    const loaded = await storageService.readAttemptAnswerFile(saved.relPath);
+    assert.equal(loaded.fileName, 'solution.py');
+    assert.equal(loaded.buffer.toString('utf8'), payload.toString('utf8'));
+  } finally {
+    await storageService.deleteAttemptAnswerFile(saved.relPath);
+  }
+
+  // 4. Sau khi xóa thì đọc lại phải báo lỗi
+  await assert.rejects(() => storageService.readAttemptAnswerFile(saved.relPath));
 });

@@ -210,6 +210,7 @@ export const CreateExamWizard: React.FC = () => {
   const [proctoring, setProctoring] = useState<ProctoringSettings>(DEFAULT_PROCTORING);
   const [advancedProctoringOpen, setAdvancedProctoringOpen] = useState(false);
   const [cameraActive, setCameraActive] = useState(false);
+  const [copiedInvite, setCopiedInvite] = useState(false);
   const [testTelemetry, setTestTelemetry] = useState<LiveTestTelemetry>({
     faceCount: null,
     yaw: null,
@@ -380,7 +381,10 @@ export const CreateExamWizard: React.FC = () => {
           }
         }, 50);
       } catch {
-        alert('Không thể truy cập camera. Vui lòng cấp quyền trình duyệt.');
+        setTestTelemetry((prev) => ({
+          ...prev,
+          errorMsg: 'Không thể truy cập camera. Vui lòng cấp quyền trình duyệt rồi thử lại.',
+        }));
       }
     }
   };
@@ -850,13 +854,14 @@ export const CreateExamWizard: React.FC = () => {
               <button
                 className="btn btn-secondary btn-sm"
                 onClick={() => {
-                  navigator.clipboard?.writeText(
+                  void navigator.clipboard?.writeText(
                     `${window.location.origin}/join/${classInfo.invite_code_students}`,
                   );
-                  alert('Đã sao chép đường dẫn mời tham gia lớp học!');
+                  setCopiedInvite(true);
+                  window.setTimeout(() => setCopiedInvite(false), 2500);
                 }}
               >
-                🔗 Copy link mời
+                {copiedInvite ? '✓ Đã sao chép link!' : '🔗 Copy link mời'}
               </button>
             )}
           </div>
