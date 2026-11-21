@@ -11,6 +11,8 @@ import { randomUUID } from 'node:crypto';
 const PRIVATE_ROOT = path.join(process.cwd(), 'private-uploads');
 export const PROCTORING_DIR = 'proctoring';
 export const ANSWER_FILES_DIR = 'answer-files';
+export const FACE_PROFILES_DIR = 'face-profiles';
+export const ATTENDANCE_DIR = 'attendance';
 export const MAX_ANSWER_FILE_BYTES = 10 * 1024 * 1024; // 10 MB
 
 export const ALLOWED_ANSWER_EXTENSIONS = new Set([
@@ -158,3 +160,42 @@ export async function deleteAttemptAnswerFile(relPath: string): Promise<void> {
   if (!absPath.startsWith(answerRoot)) return;
   await fs.rm(absPath, { force: true });
 }
+
+/** Lưu 1 trong 4 ảnh đăng ký hồ sơ khuôn mặt vào `private-uploads/face-profiles/<userId>/`. */
+export async function saveFaceProfilePhoto(
+  userId: number,
+  stepNo: number,
+  buffer: Buffer,
+): Promise<string> {
+  const relDir = path.join(FACE_PROFILES_DIR, String(userId));
+  const absDir = path.join(PRIVATE_ROOT, relDir);
+  await fs.mkdir(absDir, { recursive: true });
+  const fileName = `step-${stepNo}-${Date.now()}-${randomUUID().slice(0, 8)}.jpg`;
+  const relPath = path.join(relDir, fileName);
+  await fs.writeFile(path.join(PRIVATE_ROOT, relPath), buffer);
+  return relPath.split(path.sep).join('/');
+}
+
+/** Xóa toàn bộ thư mục ảnh hồ sơ khuôn mặt của một người dùng. */
+export async function deleteUserFaceProfileDir(userId: number): Promise<void> {
+  const absDir = path.join(PRIVATE_ROOT, FACE_PROFILES_DIR, String(userId));
+  if (!absDir.startsWith(path.join(PRIVATE_ROOT, FACE_PROFILES_DIR))) return;
+  await fs.rm(absDir, { recursive: true, force: true });
+}
+
+/** Lưu ảnh bằng chứng khi điểm danh khuôn mặt không khớp (`mismatch`). */
+export async function saveAttendanceEvidence(
+  sessionId: number,
+  roundNo: number,
+  studentId: number,
+  buffer: Buffer,
+): Promise<string> {
+  const relDir = path.join(ATTENDANCE_DIR, String(sessionId));
+  const absDir = path.join(PRIVATE_ROOT, relDir);
+  await fs.mkdir(absDir, { recursive: true });
+  const fileName = `r${roundNo}-u${studentId}-${Date.now()}-${randomUUID().slice(0, 8)}.jpg`;
+  const relPath = path.join(relDir, fileName);
+  await fs.writeFile(path.join(PRIVATE_ROOT, relPath), buffer);
+  return relPath.split(path.sep).join('/');
+}
+

@@ -123,6 +123,27 @@ export async function cleanupExpiredEvidence(): Promise<{
     await deleteLatestAttemptFrame(att.id).catch(() => {});
   }
 
+  // 5. Dọn ảnh bằng chứng điểm danh không khớp (`attendance_records.evidence_path`) đã hết hạn lưu trữ (30 ngày)
+  try {
+    const expiredAttendanceEv = await query<{ id: number; evidence_path: string }>(
+      `SELECT id, evidence_path
+         FROM attendance_records
+        WHERE evidence_path IS NOT NULL
+          AND evidence_expires_at IS NOT NULL
+          AND evidence_expires_at <= NOW()
+        LIMIT 500`,
+    );
+    for (const rec of expiredAttendanceEv) {
+      await deleteEvidenceImage(rec.evidence_path).catch(() => {});
+      await query(
+        `UPDATE attendance_records SET evidence_path = NULL WHERE id = $1`,
+        [rec.id],
+      );
+    }
+  } catch {
+    // Bảng attendance_records có thể chưa được khởi tạo trong lần chạy đầu
+  }
+
   return {
     evidenceCount: rows.length,
     precheckCount: expiredPrechecks.length,

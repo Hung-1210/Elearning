@@ -118,5 +118,29 @@ export async function logout(req: Request, res: Response): Promise<void> {
 }
 
 export async function getMe(req: Request, res: Response): Promise<void> {
-  res.json({ success: true, data: { user: req.user } });
+  try {
+    const profile = await authService.getUserProfileInfo(req.user!.userId);
+    res.json({ success: true, data: { user: profile ?? req.user } });
+  } catch {
+    res.json({ success: true, data: { user: req.user } });
+  }
 }
+
+export async function changePassword(req: Request, res: Response): Promise<void> {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    await authService.changeUserPassword(
+      req.user!.userId,
+      String(currentPassword ?? ''),
+      String(newPassword ?? ''),
+    );
+    res.json({
+      success: true,
+      message: 'Đổi mật khẩu thành công!',
+    } satisfies ApiResponse);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Không thể đổi mật khẩu';
+    res.status(400).json({ success: false, error: message });
+  }
+}
+

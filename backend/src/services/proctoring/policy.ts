@@ -66,6 +66,7 @@ export interface ProctoringSettings {
   enabled: boolean;
   verifyIdentity: boolean;
   detectIdentitySwap: boolean;
+  requireFaceProfile?: boolean;
   identityRecheckIntervalSec: number;
   identityThreshold: number;
   detectNoFace: boolean;
@@ -129,7 +130,7 @@ export const EXAM_PRESETS: Record<'relaxed' | 'balanced' | 'strict', Partial<Pro
 };
 
 export const DEFAULT_SETTINGS: ProctoringSettings = {
-  enabled: false, verifyIdentity: true, detectIdentitySwap: true, identityRecheckIntervalSec: 30,
+  enabled: false, verifyIdentity: true, detectIdentitySwap: true, requireFaceProfile: true, identityRecheckIntervalSec: 30,
   identityThreshold: 0.45, detectNoFace: true, noFaceGraceSec: 5, detectMultipleFaces: true,
   trackHeadPose: true, headSensitivity: 'normal', ...HEAD_PRESETS.normal,
   trackGaze: false, gazeSensitivity: 'normal', ...GAZE_PRESETS.normal,

@@ -11,8 +11,8 @@ import {
   FiArrowRight,
   FiRefreshCw,
 } from 'react-icons/fi';
-import { studentExamApi } from '../../api';
-import type { Exam } from '../../types';
+import { studentExamApi, faceProfileApi } from '../../api';
+import type { Exam, FaceProfileMe } from '../../types';
 import './exam.css';
 
 type ConnectionInformation = {
@@ -21,6 +21,7 @@ type ConnectionInformation = {
 
 type PrecheckExamInfo = Exam & {
   verify_identity?: boolean;
+  require_face_profile?: boolean;
   detect_identity_swap?: boolean;
 };
 
@@ -34,6 +35,8 @@ export const PrecheckRoomPage: React.FC = () => {
   const [cameraReady, setCameraReady] = useState(false);
   const [examInfo, setExamInfo] = useState<PrecheckExamInfo | null>(null);
   const [studentInfo, setStudentInfo] = useState<{ name: string; login_id: string } | null>(null);
+  const [faceProfile, setFaceProfile] = useState<FaceProfileMe | null>(null);
+  const [enrolledThumbUrl, setEnrolledThumbUrl] = useState<string | null>(null);
   const [networkPing, setNetworkPing] = useState<number | null>(null);
   const [cameraResolution, setCameraResolution] = useState<string | null>(null);
   const [faceAligned, setFaceAligned] = useState<boolean>(false);
@@ -50,13 +53,29 @@ export const PrecheckRoomPage: React.FC = () => {
   const requiresFacePrecheck = proctoringEnabled && (
     examInfo?.verify_identity !== false || Boolean(examInfo?.detect_identity_swap)
   );
+  const requiresApprovedProfileAnchor =
+    requiresFacePrecheck && examInfo?.require_face_profile !== false;
+  const hasUsableApprovedProfile = Boolean(
+    faceProfile &&
+      (faceProfile.hasUsableApprovedProfile ||
+        faceProfile.reviewStatus === 'approved' ||
+        faceProfile.usingPreviousApproved),
+  );
 
   useEffect(() => {
     if (examId) {
       studentExamApi.getExam(examId).then((response) => {
         const loadedExam = response.data.data.exam;
+        const loadedProfile = response.data.data.faceProfile || null;
         setExamInfo(loadedExam);
         setStudentInfo(response.data.data.student);
+        setFaceProfile(loadedProfile);
+        if (loadedProfile?.enrolled) {
+          faceProfileApi
+            .fetchMyPhotoBlob(1)
+            .then((res) => setEnrolledThumbUrl(URL.createObjectURL(res.data)))
+            .catch(() => {});
+        }
         if (loadedExam.proctoring_enabled) {
           void checkHardware();
         } else {
@@ -221,7 +240,11 @@ export const PrecheckRoomPage: React.FC = () => {
     }
   };
 
-  const canStart = termsAgreed && !loading && (!proctoringEnabled || Boolean(cameraPermission && cameraReady));
+  const canStart =
+    termsAgreed &&
+    !loading &&
+    (!proctoringEnabled || Boolean(cameraPermission && cameraReady)) &&
+    (!requiresApprovedProfileAnchor || hasUsableApprovedProfile);
 
   return (
     <div className="precheck-page-container">
@@ -422,19 +445,93 @@ export const PrecheckRoomPage: React.FC = () => {
         <div className="precheck-checklist-panel">
           <div className="candidate-profile-card">
             <div className="candidate-profile-heading">
-              HỒ SƠ THÍ SINH ĐỐI SOÁT{' '}
-              <span className={!requiresFacePrecheck || capturedPhoto ? 'permission-ok' : 'permission-error'}>
-                {!requiresFacePrecheck ? '✓ HỢP LỆ' : capturedPhoto ? '✓ ĐÃ CHỤP ẢNH' : 'CHỜ CHỤP ẢNH'}
+              HỒ SƠ THÍ SINH & KHUÔN MẶT MẪU{' '}
+              <span
+                className={
+                  !requiresApprovedProfileAnchor || hasUsableApprovedProfile
+                    ? 'permission-ok'
+                    : 'permission-error'
+                }
+              >
+                {!requiresApprovedProfileAnchor
+                  ? '✓ HỢP LỆ'
+                  : hasUsableApprovedProfile
+                  ? '✓ HỒ SƠ ĐÃ DUYỆT'
+                  : faceProfile?.reviewStatus === 'pending'
+                  ? '⏳ CHỜ GV DUYỆT'
+                  : '✕ CHƯA ĐĂNG KÝ'}
               </span>
             </div>
             <div className="candidate-profile-body">
-              <div className="candidate-avatar"><FiShield size={24} /></div>
+              {enrolledThumbUrl ? (
+                <img
+                  src={enrolledThumbUrl}
+                  alt="Ảnh mẫu"
+                  style={{
+                    width: 56,
+                    height: 56,
+                    borderRadius: 12,
+                    objectFit: 'cover',
+                    transform: 'scaleX(-1)',
+                    border: '2px solid #10B981',
+                    flexShrink: 0,
+                  }}
+                />
+              ) : (
+                <div className="candidate-avatar"><FiShield size={24} /></div>
+              )}
               <div>
                 <strong>{studentInfo?.name || 'Sinh viên dự thi'}</strong>
                 <span>MSSV: {studentInfo?.login_id || 'Chưa cập nhật'} • Lớp: {examInfo?.class_name || 'Đang tải'}</span>
-                <small>Dữ liệu khuôn mặt chỉ dùng để đối soát trong ca thi và tự động hủy khi hết hạn lưu trữ</small>
+                <small>
+                  {requiresApprovedProfileAnchor
+                    ? hasUsableApprovedProfile
+                      ? 'Ảnh chụp tại phòng chờ sẽ được AI đối sánh trực tiếp với hồ sơ khuôn mặt 4 góc đã được giảng viên duyệt.'
+                      : 'Đề thi yêu cầu bạn phải có hồ sơ khuôn mặt đã được giảng viên duyệt trước khi vào thi.'
+                    : 'Dữ liệu khuôn mặt chỉ dùng để đối soát trong ca thi và tự động hủy khi hết hạn lưu trữ'}
+                </small>
               </div>
             </div>
+
+            {requiresApprovedProfileAnchor && !hasUsableApprovedProfile && (
+              <div
+                style={{
+                  marginTop: 12,
+                  padding: '10px 12px',
+                  borderRadius: 10,
+                  background: '#FEF2F2',
+                  border: '1px solid #FECACA',
+                  color: '#991B1B',
+                  fontSize: 12.5,
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'space-between',
+                  gap: 10,
+                  flexWrap: 'wrap',
+                }}
+              >
+                <span>
+                  {faceProfile?.reviewStatus === 'pending'
+                    ? '⏳ Hồ sơ khuôn mặt của bạn đang chờ giảng viên duyệt. Vui lòng liên hệ giảng viên duyệt trong tab "Khuôn mặt SV".'
+                    : faceProfile?.reviewStatus === 'rejected'
+                    ? `❌ Hồ sơ khuôn mặt bị từ chối (${faceProfile.rejectReason || 'Cần chụp lại'}).`
+                    : '⚠️ Bạn chưa đăng ký hồ sơ khuôn mặt (4 ảnh) tại mục "Khuôn mặt của tôi".'}
+                </span>
+                {faceProfile?.reviewStatus !== 'pending' && (
+                  <button
+                    type="button"
+                    className="exam-btn exam-btn-primary"
+                    style={{ padding: '6px 12px', fontSize: 12 }}
+                    onClick={() => {
+                      stopCamera();
+                      navigate('/face-profile');
+                    }}
+                  >
+                    Đăng ký khuôn mặt ngay →
+                  </button>
+                )}
+              </div>
+            )}
           </div>
 
           <div className="ai-checklist-card">

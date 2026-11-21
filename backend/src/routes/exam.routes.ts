@@ -11,6 +11,7 @@ import * as attemptService from '../services/exam/attempt.service.js';
 import * as gradingService from '../services/exam/grading.service.js';
 import * as exportService from '../services/exam/export.service.js';
 import * as statsService from '../services/proctoring/stats.service.js';
+import { getMyFaceProfile } from '../services/face-profile.service.js';
 import {
   ingestFrame, ingestBrowserEvent, getIngestionMetrics, queueSupervisorNotice,
   type BrowserEventType,
@@ -72,6 +73,7 @@ router.get('/classes/:classId/question-bank', requireLogin, requireClassMembersh
       chapter: req.query.chapter as string,
       difficulty: req.query.difficulty as string,
       questionType: req.query.type as string,
+      source: req.query.source as string,
     });
     ok(res, rows);
   } catch (err) { sendError(res, err); }
@@ -184,17 +186,21 @@ router.get('/exams/:examId', requireLogin, requireLecturer, requireExamOwnership
 
 router.get('/exams/:examId/student', requireLogin, requireStudent, requireEnrolledInExamClass, async (req, res) => {
   try {
-    const exam = await examService.getExamForStudent(Number(req.params.examId));
-    const student = await queryOne<{ name: string; login_id: string }>(
-      `SELECT u.name, COALESCE(ul.login_id, '') AS login_id
-         FROM users u
-         LEFT JOIN user_login_id ul ON ul.user_id = u.id
-        WHERE u.id = $1`,
-      [req.user!.userId],
-    );
+    const [exam, student, faceProfile] = await Promise.all([
+      examService.getExamForStudent(Number(req.params.examId)),
+      queryOne<{ name: string; login_id: string }>(
+        `SELECT u.name, COALESCE(ul.login_id, '') AS login_id
+           FROM users u
+           LEFT JOIN user_login_id ul ON ul.user_id = u.id
+          WHERE u.id = $1`,
+        [req.user!.userId],
+      ),
+      getMyFaceProfile(req.user!.userId).catch(() => null),
+    ]);
     ok(res, {
       exam,
       student: student ?? { name: '', login_id: '' },
+      faceProfile,
     });
   } catch (err) { sendError(res, err); }
 });

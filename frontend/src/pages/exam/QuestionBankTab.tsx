@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
-import { questionBankApi } from '../../api';
-import type { BankQuestion, BankQuestionOption } from '../../types';
+import { useSearchParams } from 'react-router-dom';
+import { questionBankApi, aiApi } from '../../api';
+import type { AiGenerationJob, BankQuestion, BankQuestionOption } from '../../types';
+import { AiQuestionWizard } from './ai/AiQuestionWizard';
 import './exam.css';
 
 interface QuestionBankTabProps {
@@ -9,6 +11,7 @@ interface QuestionBankTabProps {
 
 export function QuestionBankTab({ classId }: QuestionBankTabProps) {
   const numericClassId = typeof classId === 'string' ? parseInt(classId, 10) : classId;
+  const [searchParams, setSearchParams] = useSearchParams();
   const [questions, setQuestions] = useState<BankQuestion[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -16,6 +19,14 @@ export function QuestionBankTab({ classId }: QuestionBankTabProps) {
   const [filterChapter, setFilterChapter] = useState('all');
   const [filterDifficulty, setFilterDifficulty] = useState('all');
   const [filterType, setFilterType] = useState('all');
+  const [filterSource, setFilterSource] = useState('all');
+
+  // AI Question Wizard & Job History
+  const [showAiWizard, setShowAiWizard] = useState(false);
+  const [wizardInitialDocs, setWizardInitialDocs] = useState<number[]>([]);
+  const [wizardInitialJobId, setWizardInitialJobId] = useState<number | null>(null);
+  const [pastJobs, setPastJobs] = useState<AiGenerationJob[]>([]);
+  const [showPastJobsMenu, setShowPastJobsMenu] = useState(false);
 
   // Pagination state (thật, không hardcode 1 2 3 ... 15)
   const [pageSize, setPageSize] = useState<number>(10);
@@ -64,13 +75,39 @@ export function QuestionBankTab({ classId }: QuestionBankTabProps) {
     }
   };
 
+  const loadPastAiJobs = async () => {
+    try {
+      const res = await aiApi.listQuestionJobs(numericClassId);
+      setPastJobs(res.data?.data ?? []);
+    } catch {
+      // ignore
+    }
+  };
+
   useEffect(() => {
     void loadQuestions();
+    void loadPastAiJobs();
   }, [classId]);
 
   useEffect(() => {
+    const aiDocsParam = searchParams.get('aiDocs');
+    if (aiDocsParam) {
+      const ids = aiDocsParam
+        .split(',')
+        .map((s) => parseInt(s.trim(), 10))
+        .filter((n) => Number.isInteger(n) && n > 0);
+      setWizardInitialDocs(ids);
+      setWizardInitialJobId(null);
+      setShowAiWizard(true);
+      const next = new URLSearchParams(searchParams);
+      next.delete('aiDocs');
+      setSearchParams(next, { replace: true });
+    }
+  }, [searchParams]);
+
+  useEffect(() => {
     setCurrentPage(1);
-  }, [search, filterChapter, filterDifficulty, filterType, pageSize]);
+  }, [search, filterChapter, filterDifficulty, filterType, filterSource, pageSize]);
 
   // Statistics calculation (100% dữ liệu thật từ DB)
   const totalCount = questions.length;
@@ -110,9 +147,11 @@ export function QuestionBankTab({ classId }: QuestionBankTabProps) {
             q.question_type === 'multiple_choice')) ||
         (filterType === 'essay' &&
           (q.question_type === 'essay' || q.question_type === 'file_upload'));
-      return matchSearch && matchChapter && matchDiff && matchType;
+      const qSource = q.source || 'manual';
+      const matchSource = filterSource === 'all' || qSource === filterSource;
+      return matchSearch && matchChapter && matchDiff && matchType && matchSource;
     });
-  }, [questions, search, filterChapter, filterDifficulty, filterType]);
+  }, [questions, search, filterChapter, filterDifficulty, filterType, filterSource]);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
   const safePage = Math.min(currentPage, totalPages);
@@ -347,6 +386,135 @@ export function QuestionBankTab({ classId }: QuestionBankTabProps) {
             style={{ display: 'none' }}
             onChange={(e) => void handleImportJsonFile(e)}
           />
+          <button
+            type="button"
+            onClick={() => {
+              setWizardInitialDocs([]);
+              setWizardInitialJobId(null);
+              setShowAiWizard(true);
+            }}
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              padding: '10px 18px',
+              background: 'linear-gradient(135deg, #7C3AED 0%, #4F46E5 100%)',
+              border: 'none',
+              borderRadius: 10,
+              fontSize: 14,
+              fontWeight: 700,
+              color: '#FFFFFF',
+              boxShadow: '0 4px 14px rgba(124, 58, 237, 0.32)',
+              cursor: 'pointer',
+            }}
+          >
+            <span>✨</span> Tạo bằng AI
+          </button>
+
+          {pastJobs.length > 0 && (
+            <div style={{ position: 'relative' }}>
+              <button
+                type="button"
+                onClick={() => setShowPastJobsMenu((prev) => !prev)}
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 6,
+                  padding: '10px 14px',
+                  background: '#F5F3FF',
+                  border: '1px solid #DDD6FE',
+                  borderRadius: 10,
+                  fontSize: 13.5,
+                  fontWeight: 600,
+                  color: '#5B21B6',
+                  cursor: 'pointer',
+                }}
+              >
+                <span>🕘</span> Lần tạo trước ({pastJobs.length})
+              </button>
+
+              {showPastJobsMenu && (
+                <div
+                  style={{
+                    position: 'absolute',
+                    top: 'calc(100% + 6px)',
+                    right: 0,
+                    width: 320,
+                    maxHeight: 280,
+                    overflowY: 'auto',
+                    background: '#FFFFFF',
+                    border: '1px solid #E2E8F0',
+                    borderRadius: 12,
+                    boxShadow: '0 12px 28px rgba(15, 23, 42, 0.14)',
+                    padding: 10,
+                    zIndex: 100,
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: 12,
+                      fontWeight: 700,
+                      color: '#64748B',
+                      marginBottom: 8,
+                    }}
+                  >
+                    MỞ LẠI BẢN NHÁP AI
+                  </div>
+                  {pastJobs.map((job) => (
+                    <div
+                      key={job.id}
+                      onClick={() => {
+                        setShowPastJobsMenu(false);
+                        setWizardInitialJobId(job.id);
+                        setShowAiWizard(true);
+                      }}
+                      style={{
+                        padding: '8px 10px',
+                        borderRadius: 8,
+                        border: '1px solid #F1F5F9',
+                        marginBottom: 6,
+                        cursor: 'pointer',
+                        background: '#F8FAFC',
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: 'flex',
+                          justifyContent: 'space-between',
+                          fontSize: 12.5,
+                          fontWeight: 700,
+                          color: '#0F172A',
+                        }}
+                      >
+                        <span>Lần tạo #{job.id}</span>
+                        <span
+                          style={{
+                            color:
+                              job.status === 'done'
+                                ? '#16A34A'
+                                : job.status === 'failed'
+                                  ? '#DC2626'
+                                  : '#D97706',
+                          }}
+                        >
+                          {job.status === 'done'
+                            ? `${job.pendingDrafts ?? 0} chờ duyệt`
+                            : job.status === 'running'
+                              ? 'Đang chạy...'
+                              : 'Lỗi'}
+                        </span>
+                      </div>
+                      <div style={{ fontSize: 11.5, color: '#64748B', marginTop: 2 }}>
+                        {new Date(job.createdAt).toLocaleString('vi-VN')} · Tổng{' '}
+                        {job.totalDrafts ?? 0} câu ({job.acceptedDrafts ?? 0} đã thêm)
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           <button
             type="button"
             onClick={() => importFileInputRef.current?.click()}
@@ -716,6 +884,24 @@ export function QuestionBankTab({ classId }: QuestionBankTabProps) {
           <option value="mc">Trắc nghiệm</option>
           <option value="essay">Tự luận & Tệp</option>
         </select>
+
+        <select
+          value={filterSource}
+          onChange={(e) => setFilterSource(e.target.value)}
+          style={{
+            padding: '10px 14px',
+            border: '1px solid #E2E8F0',
+            borderRadius: 10,
+            background: '#F8FAFC',
+            fontSize: 14,
+            color: '#334155',
+          }}
+        >
+          <option value="all">Tất cả nguồn</option>
+          <option value="ai">✨ Tạo bởi AI</option>
+          <option value="manual">✍️ Tạo thủ công</option>
+          <option value="import">📤 Nhập JSON</option>
+        </select>
       </div>
 
       {/* ── Question Cards List ── */}
@@ -809,6 +995,35 @@ export function QuestionBankTab({ classId }: QuestionBankTabProps) {
                     >
                       {q.default_points} đ
                     </span>
+                    {q.source === 'ai' && (
+                      <span
+                        style={{
+                          background: 'linear-gradient(135deg, #F5F3FF 0%, #EEF2FF 100%)',
+                          border: '1px solid #C4B5FD',
+                          color: '#6D28D9',
+                          padding: '2px 9px',
+                          borderRadius: 9999,
+                          fontSize: 11.5,
+                          fontWeight: 700,
+                        }}
+                      >
+                        ✨ AI
+                      </span>
+                    )}
+                    {q.source === 'import' && (
+                      <span
+                        style={{
+                          background: '#F1F5F9',
+                          color: '#475569',
+                          padding: '2px 8px',
+                          borderRadius: 9999,
+                          fontSize: 11.5,
+                          fontWeight: 600,
+                        }}
+                      >
+                        📤 JSON
+                      </span>
+                    )}
                   </div>
 
                   {/* Action Buttons */}
@@ -1442,6 +1657,27 @@ export function QuestionBankTab({ classId }: QuestionBankTabProps) {
           </div>
         </div>
       )}
+
+      <AiQuestionWizard
+        open={showAiWizard}
+        onClose={() => {
+          setShowAiWizard(false);
+          setWizardInitialJobId(null);
+          void loadPastAiJobs();
+        }}
+        classId={numericClassId}
+        availableChapters={availableChapters}
+        initialDocIds={wizardInitialDocs}
+        initialJobId={wizardInitialJobId}
+        onAcceptedSuccess={(count) => {
+          setActionSuccess(
+            `Đã thêm thành công ${count} câu hỏi từ AI vào ngân hàng câu hỏi của lớp.`,
+          );
+          window.setTimeout(() => setActionSuccess(null), 5500);
+          void loadQuestions();
+          void loadPastAiJobs();
+        }}
+      />
     </div>
   );
 }

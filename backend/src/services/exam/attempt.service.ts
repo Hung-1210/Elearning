@@ -2,7 +2,7 @@
 import type { PoolClient } from 'pg';
 import { query, queryOne, withTransaction, pool } from '../../config/database.js';
 import { HttpError } from '../../utils/http-error.js';
-import { registerFace, AiInputError, AiServiceError } from '../proctoring/ai-client.js';
+import { registerFace, analyzeFrame, AiInputError, AiServiceError } from '../proctoring/ai-client.js';
 import {
   saveEvidenceImage,
   saveAttemptAnswerFile,
@@ -11,13 +11,19 @@ import {
 } from '../proctoring/storage.js';
 import { broadcastAttemptStatus, getMonitorIo } from '../../sockets/monitor.socket.js';
 import { computeStudentResultVisibility } from './visibility.js';
+import {
+  ensureFaceAttendanceTables,
+  getUsableApprovedEmbedding,
+  cosineSimilarity,
+} from '../face-profile.service.js';
 
 const PRECHECK_TTL_MINUTES = 10;
 
 // ===========================================================================
-// PRE-CHECK
+// PRE-CHECK (tích hợp cổng đối chiếu Hồ sơ khuôn mặt - P5 / Mục 8.6)
 // ===========================================================================
 export async function createPrecheckSession(examId: number, studentId: number, imageBuffer: Buffer) {
+  await ensureFaceAttendanceTables();
   const exam = await queryOne<{ start_time: Date; end_time: Date }>(
     'SELECT start_time, end_time FROM exams WHERE id = $1', [examId],
   );
@@ -26,11 +32,82 @@ export async function createPrecheckSession(examId: number, studentId: number, i
   if (now < new Date(exam.start_time)) throw new HttpError(400, 'Đề thi chưa mở');
   if (now > new Date(exam.end_time)) throw new HttpError(400, 'Đề thi đã đóng');
 
+  const settingsRow = await queryOne<{
+    enabled: boolean;
+    verify_identity: boolean;
+    detect_identity_swap: boolean;
+    require_face_profile: boolean | null;
+    identity_threshold: number | null;
+  }>(
+    `SELECT enabled, verify_identity, detect_identity_swap,
+            COALESCE(require_face_profile, TRUE) AS require_face_profile,
+            identity_threshold
+       FROM exam_proctoring_settings
+      WHERE exam_id = $1`,
+    [examId],
+  );
+
+  const requiresIdentityAnchor = Boolean(
+    settingsRow?.enabled &&
+      (settingsRow.verify_identity || settingsRow.detect_identity_swap) &&
+      settingsRow.require_face_profile !== false,
+  );
+
+  let profileEmbedding: number[] | null = null;
+  if (requiresIdentityAnchor) {
+    const profile = await getUsableApprovedEmbedding(studentId);
+    if (!profile.usableEmbedding) {
+      if (profile.status === 'pending') {
+        throw new HttpError(
+          403,
+          'Hồ sơ khuôn mặt của bạn đang ở trạng thái "Chờ giảng viên duyệt". Vui lòng nhờ giảng viên duyệt hồ sơ trước khi vào thi.',
+        );
+      }
+      if (profile.status === 'rejected') {
+        throw new HttpError(
+          403,
+          `Hồ sơ khuôn mặt của bạn đã bị từ chối (${profile.rejectReason || 'ảnh chưa đạt'}). Vui lòng vào mục "Khuôn mặt của tôi" để đăng ký lại và nhờ giảng viên duyệt.`,
+        );
+      }
+      throw new HttpError(
+        403,
+        'Đề thi này yêu cầu sinh viên đã đăng ký và được duyệt hồ sơ khuôn mặt. Vui lòng vào mục "Khuôn mặt của tôi" ở thanh bên trái để đăng ký trước khi vào thi.',
+      );
+    }
+    profileEmbedding = profile.usableEmbedding;
+  }
+
   let embedding: number[];
   try {
     const result = await registerFace(imageBuffer);
     embedding = result.embedding;
+
+    // Nếu đề thi bật đối chiếu hồ sơ khuôn mặt, gọi analyze (face + identity) hoặc so khớp Cosine với hồ sơ đã duyệt
+    if (profileEmbedding) {
+      const threshold = Number(settingsRow?.identity_threshold ?? 0.45);
+      let similarity = cosineSimilarity(embedding, profileEmbedding);
+      try {
+        const analysis = await analyzeFrame({
+          imageBuffer,
+          referenceEmbedding: profileEmbedding,
+          run: { face: true, identity: true, headPose: false, gaze: false, objects: false },
+        });
+        if (analysis.primary?.similarity !== null && analysis.primary?.similarity !== undefined) {
+          similarity = Number(analysis.primary.similarity);
+        }
+      } catch {
+        // Nếu endpoint /analyze bận tạm thời, vẫn có kết quả Cosine từ 2 vector 512 chiều cùng model buffalo_sc
+      }
+
+      if (similarity < threshold) {
+        throw new HttpError(
+          422,
+          `Khuôn mặt vừa chụp không khớp với hồ sơ khuôn mặt đã đăng ký của bạn (độ tương đồng ${similarity.toFixed(2)} < ngưỡng ${threshold.toFixed(2)}). Hãy nhìn thẳng, đủ ánh sáng và thử lại.`,
+        );
+      }
+    }
   } catch (err) {
+    if (err instanceof HttpError) throw err;
     // Ảnh không đạt (không mặt/nhiều mặt/mờ...) => 422 kèm lý do thật từ AI.
     if (err instanceof AiInputError) throw new HttpError(422, err.message);
     // AI hỏng/quá tải => 503, KHÔNG nói là lỗi của thí sinh và KHÔNG cho qua bước xác thực.

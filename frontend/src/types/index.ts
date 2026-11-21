@@ -5,6 +5,7 @@ export interface AuthPayload {
   userId: number;
   name: string;
   isLecturer: boolean;
+  loginId?: string;
 }
 
 export interface AuthResponse {
@@ -120,6 +121,9 @@ export interface BankQuestion {
   difficulty: 'easy' | 'medium' | 'hard';
   chapter?: string;
   tags?: string[];
+  source?: 'manual' | 'import' | 'ai';
+  ai_draft_id?: number | null;
+  source_doc_ids?: number[];
   created_at: string;
   updated_at?: string;
   options?: BankQuestionOption[];
@@ -305,3 +309,245 @@ export interface BehaviorStat {
   count: number;
   totalDurationSec: number;
 }
+
+// ── Face Profile & Meeting Attendance Types ──────────────────
+export type FaceReviewStatus = 'unregistered' | 'pending' | 'approved' | 'rejected';
+
+export interface FaceProfileMe {
+  enrolled: boolean;
+  reviewStatus: FaceReviewStatus;
+  hasUsableApprovedProfile: boolean;
+  usingPreviousApproved: boolean;
+  needsReEnroll: boolean;
+  sidebarDotColor: 'green' | 'yellow' | 'red';
+  sampleCount: number;
+  modelVersion: string | null;
+  consentedAt: string | null;
+  reviewedAt: string | null;
+  reviewerName: string | null;
+  rejectReason: string | null;
+  enrollmentCount: number;
+  createdAt: string | null;
+  updatedAt: string | null;
+  photos: Array<{
+    stepNo: number;
+    faceScore: number | null;
+    createdAt: string;
+  }>;
+  aiState: 'ready' | 'not_ready' | 'unreachable';
+}
+
+export interface ClassFaceProfileItem {
+  studentId: number;
+  studentName: string;
+  loginId: string;
+  status: FaceReviewStatus;
+  sampleCount: number;
+  modelVersion: string | null;
+  consentedAt: string | null;
+  reviewedBy: number | null;
+  reviewerName: string | null;
+  reviewedAt: string | null;
+  rejectReason: string | null;
+  enrollmentCount: number;
+  hasPreviousApproved: boolean;
+  photoSteps: number[];
+  updatedAt: string | null;
+}
+
+export interface ClassFaceProfileSummary {
+  total: number;
+  pending: number;
+  approved: number;
+  rejected: number;
+  unregistered: number;
+}
+
+export type AttendanceStatus =
+  | 'pending'
+  | 'present'
+  | 'mismatch'
+  | 'absent'
+  | 'no_profile'
+  | 'manual';
+
+export interface AttendanceRecord {
+  id: number;
+  sessionId: number;
+  roundNo: number;
+  studentId: number;
+  studentName: string;
+  loginId: string;
+  status: AttendanceStatus;
+  effectiveStatus: 'present' | 'pending' | 'mismatch' | 'absent' | 'no_profile';
+  subStatus: string | null;
+  similarity: number | null;
+  faceCount: number | null;
+  attempts: number;
+  hasEvidence: boolean;
+  checkedAt: string | null;
+  overrideBy: number | null;
+  overrideByName: string | null;
+  overrideAt: string | null;
+  overrideReason: string | null;
+  roundsPassed: number;
+  totalRounds: number;
+  periodicOverall: 'present' | 'partial' | 'mismatch' | 'absent' | 'no_profile' | 'pending';
+  roundHistory: Array<{
+    roundNo: number;
+    status: string;
+    effectiveStatus: string;
+    similarity: number | null;
+    checkedAt: string | null;
+  }>;
+}
+
+export interface AttendanceSession {
+  id: number;
+  meetingCode: string;
+  classId: number;
+  className: string;
+  startedBy: number;
+  startedByName: string | null;
+  mode: 'once' | 'periodic';
+  strictness: 'relaxed' | 'balanced' | 'strict';
+  windowSec: number;
+  threshold: number;
+  intervalMin: number | null;
+  maxRounds: number | null;
+  currentRound: number;
+  roundOpen: boolean;
+  roundEndsAt: string;
+  nextRoundAt: string | null;
+  passRatio: number;
+  duplicateWarnings: Array<{
+    studentAId: number;
+    studentAName: string;
+    studentBId: number;
+    studentBName: string;
+    similarity: number;
+  }>;
+  startedAt: string;
+  endedAt: string | null;
+  aiState: 'ready' | 'not_ready' | 'unreachable';
+  summary: {
+    total: number;
+    present: number;
+    pending: number;
+    mismatch: number;
+    absent: number;
+    noProfile: number;
+    pendingReviewProfile: number;
+    manual: number;
+    partialPeriodic: number;
+  };
+  records: AttendanceRecord[];
+}
+
+// ── RAG Chat & AI Question Generation Types ──────────────────
+export interface DocIngestionStatus {
+  docId: number;
+  fileName: string;
+  displayFileName: string;
+  categoryName: string;
+  status: 'pending' | 'processing' | 'ready' | 'failed' | 'unsupported';
+  errorCode: string | null;
+  errorMessage: string | null;
+  pageCount: number | null;
+  charCount: number | null;
+  chunkCount: number;
+  updatedAt: string | null;
+  headings: string[];
+}
+
+export interface RagCitation {
+  n: number;
+  chunkId: number;
+  docId: number;
+  fileName: string;
+  displayFileName: string;
+  pageFrom: number | null;
+  pageTo: number | null;
+  heading: string | null;
+  snippet: string;
+}
+
+export interface RagConversation {
+  id: number;
+  classId: number;
+  userId?: number;
+  title: string;
+  docScope: number[] | null;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface RagMessage {
+  id: number;
+  conversationId: number;
+  role: 'user' | 'assistant';
+  content: string;
+  citations: RagCitation[];
+  grounded: boolean;
+  latencyMs?: number | null;
+  feedback?: -1 | 1 | null;
+  createdAt: string;
+  streaming?: boolean;
+}
+
+export type AiQuestionType = 'single_choice' | 'multiple_choice' | 'essay';
+export type AiDifficulty = 'easy' | 'medium' | 'hard';
+
+export interface AiDraftOption {
+  content: string;
+  isCorrect: boolean;
+}
+
+export interface AiQuestionDraft {
+  id: number;
+  jobId: number;
+  classId: number;
+  questionType: AiQuestionType;
+  difficulty: AiDifficulty;
+  content: string;
+  options: AiDraftOption[];
+  explanation: string | null;
+  chapter: string | null;
+  tags: string[];
+  defaultPoints: number;
+  sourceChunkIds: number[];
+  sourceDocId: number | null;
+  sourceFileName: string | null;
+  sourcePageFrom: number | null;
+  sourcePageTo: number | null;
+  sourceQuote: string | null;
+  qualityFlags: string[];
+  duplicateOf: number | null;
+  duplicateContent: string | null;
+  verifyNote: string | null;
+  status: 'draft' | 'accepted' | 'discarded';
+  bankQuestionId: number | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AiGenerationJob {
+  id: number;
+  classId: number;
+  lecturerId?: number;
+  docIds?: number[];
+  config: any;
+  status: 'queued' | 'running' | 'done' | 'failed' | 'cancelled';
+  progress: number;
+  errorMessage: string | null;
+  tokensIn?: number;
+  tokensOut?: number;
+  createdAt: string;
+  finishedAt: string | null;
+  drafts?: AiQuestionDraft[];
+  totalDrafts?: number;
+  pendingDrafts?: number;
+  acceptedDrafts?: number;
+}
+
+

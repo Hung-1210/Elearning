@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useMemo } from 'react';
 import { documentApi, classApi } from '../../api';
 import type { ClassInfo, DocCategoryRaw } from '../../types';
-import Sidebar from '../../components/layout/Sidebar';
+import Sidebar, { MobileMenuButton } from '../../components/layout/Sidebar';
 import { useLayoutStore } from '../../store/layoutStore';
 
 interface DocItem {
@@ -195,6 +195,7 @@ export default function DocumentsPage() {
         {/* Header */}
         <header className="page-header">
           <div className="page-header-left">
+            <MobileMenuButton />
             <div className="page-header-breadcrumb">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
                 <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>

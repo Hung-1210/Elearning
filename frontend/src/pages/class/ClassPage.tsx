@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useMemo, useRef } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
-import { classApi, exerciseApi, meetingApi, documentApi } from '../../api';
+import { classApi, exerciseApi, meetingApi, documentApi, faceProfileApi, aiApi, examApi } from '../../api';
 import { useAuthStore } from '../../store/authStore';
 import type {
   ClassInfo,
@@ -10,12 +10,28 @@ import type {
   ClassAttachFile,
   DocCategoryRaw,
   SubmittedFile,
+  ClassFaceProfileSummary,
+  DocIngestionStatus,
+  Exam,
 } from '../../types';
-import Sidebar from '../../components/layout/Sidebar';
+import Sidebar, { MobileMenuButton, type ClassTabKey } from '../../components/layout/Sidebar';
 import { useLayoutStore } from '../../store/layoutStore';
 import { QuestionBankTab, TeacherExamListTab, StudentExamListTab } from '../exam';
+import ClassFaceProfilesTab from './ClassFaceProfilesTab';
+import { RagChatDrawer } from './rag/RagChatDrawer';
 
-type Tab = 'overview' | 'exercises' | 'meetings' | 'students' | 'documents' | 'exams' | 'question-bank';
+type Tab = ClassTabKey;
+
+const TAB_LABELS: Record<Tab, string> = {
+  overview: 'Tổng quan',
+  exercises: 'Bài tập',
+  meetings: 'Buổi học',
+  students: 'Học viên',
+  'face-profiles': 'Khuôn mặt sinh viên',
+  documents: 'Tài liệu lớp',
+  exams: 'Đề thi',
+  'question-bank': 'Ngân hàng câu hỏi',
+};
 
 interface CategoryGroup {
   id: number;
@@ -29,7 +45,7 @@ export default function ClassPage() {
   const { id } = useParams<{ id: string }>();
   const classId = parseInt(id || '0', 10);
   const navigate = useNavigate();
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const { user } = useAuthStore();
   const { sidebarCollapsed } = useLayoutStore();
   const isLecturer = user?.isLecturer;
@@ -38,17 +54,33 @@ export default function ClassPage() {
   const [activeTab, setActiveTab] = useState<Tab>(initialTab);
 
   useEffect(() => {
-    const tabParam = searchParams.get('tab') as Tab;
-    if (tabParam && tabParam !== activeTab) {
+    const tabParam = (searchParams.get('tab') as Tab) || 'overview';
+    if (tabParam !== activeTab) {
       setActiveTab(tabParam);
     }
-  }, [searchParams]);
+  }, [searchParams, classId]);
+
+  const handleSelectTab = (tab: Tab) => {
+    setActiveTab(tab);
+    if (tab === 'overview') {
+      setSearchParams({}, { replace: true });
+    } else {
+      setSearchParams({ tab }, { replace: true });
+    }
+  };
   const [allClasses, setAllClasses] = useState<ClassInfo[]>([]);
   const [classInfo, setClassInfo] = useState<ClassInfo | null>(null);
   const [exercises, setExercises] = useState<Exercise[]>([]);
   const [meetings, setMeetings] = useState<Meeting[]>([]);
   const [students, setStudents] = useState<Student[]>([]);
   const [classDocs, setClassDocs] = useState<ClassAttachFile[]>([]);
+  const [classExams, setClassExams] = useState<Exam[]>([]);
+  const [docsAiStatus, setDocsAiStatus] = useState<DocIngestionStatus[]>([]);
+  const [geminiConfigured, setGeminiConfigured] = useState(true);
+  const [showRagDrawer, setShowRagDrawer] = useState(false);
+  const [openDocMenuId, setOpenDocMenuId] = useState<number | null>(null);
+  const [aiToastMsg, setAiToastMsg] = useState<string | null>(null);
+  const [faceSummary, setFaceSummary] = useState<ClassFaceProfileSummary | null>(null);
   const [loading, setLoading] = useState(true);
 
   // Class Name Edit Modal
@@ -124,22 +156,38 @@ export default function ClassPage() {
   const loadAll = async () => {
     setLoading(true);
     try {
-      const [classRes, allClassRes, exRes, meetRes, docRes] = await Promise.all([
+      const [classRes, allClassRes, exRes, meetRes, docRes, examRes] = await Promise.all([
         classApi.getById(classId),
         classApi.getAll(),
         exerciseApi.getByClass(classId),
         meetingApi.getByClass(classId),
         classApi.getAttachFiles(classId),
+        examApi.listForClass(classId).catch(() => null),
       ]);
       setClassInfo(classRes.data.data);
       setAllClasses(allClassRes.data.data || []);
       setExercises(exRes.data.data || []);
       setMeetings(meetRes.data.data || []);
       setClassDocs(docRes.data.data || []);
+      if (examRes?.data) {
+        const rawExams = Array.isArray(examRes.data.data)
+          ? examRes.data.data
+          : (examRes.data.data as { exams?: Exam[] })?.exams || examRes.data.exams || [];
+        setClassExams(rawExams);
+      } else {
+        setClassExams([]);
+      }
+      void reloadDocsAiStatus();
 
       if (isLecturer) {
-        const studentRes = await classApi.getStudents(classId);
+        const [studentRes, faceRes] = await Promise.all([
+          classApi.getStudents(classId),
+          faceProfileApi.listForClass(classId).catch(() => null),
+        ]);
         setStudents(studentRes.data.data || []);
+        if (faceRes?.data?.data?.summary) {
+          setFaceSummary(faceRes.data.data.summary);
+        }
       }
     } catch (err) {
       console.error(err);
@@ -167,8 +215,34 @@ export default function ClassPage() {
     try {
       const res = await classApi.getAttachFiles(classId);
       setClassDocs(res.data.data || []);
+      void reloadDocsAiStatus();
     } catch {}
   };
+
+  const reloadDocsAiStatus = async () => {
+    try {
+      const res = await aiApi.getDocsStatus(classId);
+      setDocsAiStatus(res.data.data.docs || []);
+      setGeminiConfigured(res.data.data.geminiConfigured);
+    } catch {}
+  };
+
+  useEffect(() => {
+    if (activeTab !== 'documents') return;
+    void reloadDocsAiStatus();
+  }, [activeTab, classId]);
+
+  useEffect(() => {
+    if (activeTab !== 'documents') return;
+    const hasPending = docsAiStatus.some(
+      (d) => d.status === 'pending' || d.status === 'processing',
+    );
+    if (!hasPending) return;
+    const timer = window.setInterval(() => {
+      void reloadDocsAiStatus();
+    }, 3500);
+    return () => window.clearInterval(timer);
+  }, [activeTab, docsAiStatus]);
 
   const reloadStudents = async () => {
     try {
@@ -530,11 +604,31 @@ export default function ClassPage() {
         await classApi.removeAttachFile(classId, docId);
       } else {
         await classApi.attachFile(classId, docId);
+        setAiToastMsg('Đang chuẩn bị tài liệu cho Trợ giảng AI…');
+        window.setTimeout(() => setAiToastMsg(null), 4000);
       }
       await reloadClassDocs();
     } catch {
       alert('Thao tác đính kèm tệp thất bại');
     }
+  };
+
+  const handleReindexDoc = async (docId: number) => {
+    setOpenDocMenuId(null);
+    try {
+      await aiApi.reindexDoc(docId);
+      setAiToastMsg('Đã đưa tài liệu vào hàng đợi lập chỉ mục lại cho AI…');
+      window.setTimeout(() => setAiToastMsg(null), 4000);
+      await reloadDocsAiStatus();
+    } catch (err: any) {
+      alert(err.response?.data?.error || 'Không thể lập chỉ mục lại tài liệu.');
+    }
+  };
+
+  const handleOpenAiQuestionFromDoc = (docId: number) => {
+    setOpenDocMenuId(null);
+    setActiveTab('question-bank');
+    navigate(`/class/${classId}?tab=question-bank&aiDocs=${docId}`);
   };
 
   // ── Helpers ─────────────────────────────────────────────────────
@@ -570,33 +664,167 @@ export default function ClassPage() {
     return map;
   }, [classDocs]);
 
+  // Real progress statistics for Class Overview
+  const classProgress = useMemo(() => {
+    const memberTotal = Math.max(isLecturer ? students.length : classInfo?.member_count || 1, 1);
+
+    // 1. Exercise progress
+    let exercisePct = 0;
+    if (exercises.length > 0) {
+      if (isLecturer) {
+        const avg =
+          exercises.reduce(
+            (sum, ex) => sum + Math.min(100, ((ex.submission_count || 0) / memberTotal) * 100),
+            0,
+          ) / exercises.length;
+        exercisePct = Math.round(avg);
+      } else {
+        const submittedCount = exercises.filter((ex) => ex.submission_status === 'submitted').length;
+        exercisePct = Math.round((submittedCount / exercises.length) * 100);
+      }
+    }
+
+    // 2. Meeting progress (started or ended / total)
+    let meetingPct = 0;
+    if (meetings.length > 0) {
+      const doneOrLive = meetings.filter((m) => m.status === 'ended' || m.status === 'started').length;
+      meetingPct = Math.round((doneOrLive / meetings.length) * 100);
+    }
+
+    // 3. Document AI-ready progress
+    let docPct = 0;
+    if (classDocs.length > 0) {
+      const readyCount = docsAiStatus.filter((d) => d.status === 'ready').length;
+      docPct = docsAiStatus.length > 0
+        ? Math.min(100, Math.round((readyCount / classDocs.length) * 100))
+        : 100;
+    }
+
+    const activeMetrics = [
+      exercises.length > 0 ? exercisePct : null,
+      meetings.length > 0 ? meetingPct : null,
+      classDocs.length > 0 ? docPct : null,
+    ].filter((v): v is number => v !== null);
+
+    const overallPct =
+      activeMetrics.length > 0
+        ? Math.round(activeMetrics.reduce((a, b) => a + b, 0) / activeMetrics.length)
+        : 0;
+
+    return { exercisePct, meetingPct, docPct, overallPct };
+  }, [exercises, meetings, classDocs, docsAiStatus, students.length, classInfo?.member_count, isLecturer]);
+
+  // Real recent activities for Class Overview
+  const recentActivities = useMemo(() => {
+    const items: {
+      id: string;
+      title: string;
+      timeText: string;
+      ts: number;
+      tab: Tab;
+      bg: string;
+      color: string;
+      kind: 'exercise' | 'doc' | 'meeting' | 'exam';
+    }[] = [];
+
+    exercises.slice(0, 3).forEach((ex) => {
+      const ts = new Date(ex.start_time || ex.end_time).getTime() || 0;
+      const detail = isLecturer
+        ? `Bài tập "${ex.name}" — ${ex.submission_count || 0}/${students.length} học viên đã nộp`
+        : `Bài tập "${ex.name}" — ${ex.submission_status === 'submitted' ? 'Đã nộp' : 'Chưa nộp'}`;
+      items.push({
+        id: `ex-${ex.id}`,
+        title: detail,
+        timeText: formatDate(ex.end_time),
+        ts,
+        tab: 'exercises',
+        bg: '#EEF2FF',
+        color: '#4F46E5',
+        kind: 'exercise',
+      });
+    });
+
+    meetings.slice(0, 2).forEach((m) => {
+      const ts = new Date(m.start_time).getTime() || 0;
+      const statusLabel =
+        m.status === 'started' ? 'Đang diễn ra' : m.status === 'ended' ? 'Đã kết thúc' : 'Sắp diễn ra';
+      items.push({
+        id: `mt-${m.id}`,
+        title: `Buổi học "${m.name}" (${statusLabel})`,
+        timeText: formatDate(m.start_time),
+        ts,
+        tab: 'meetings',
+        bg: '#EFF6FF',
+        color: '#2563EB',
+        kind: 'meeting',
+      });
+    });
+
+    classDocs.slice(0, 2).forEach((d) => {
+      const aiDoc = docsAiStatus.find((s) => s.docId === d.doc_id);
+      const statusSuffix =
+        aiDoc?.status === 'ready'
+          ? 'đã sẵn sàng cho AI'
+          : aiDoc?.status === 'processing'
+          ? 'đang xử lý chỉ mục AI'
+          : 'đã được gắn vào lớp';
+      items.push({
+        id: `doc-${d.doc_id}`,
+        title: `Tài liệu "${getDisplayFileName(d.file_name)}" ${statusSuffix}`,
+        timeText: d.category_name || 'Tài liệu lớp',
+        ts: Date.now() - 1000 * 60 * 60,
+        tab: 'documents',
+        bg: '#ECFDF5',
+        color: '#059669',
+        kind: 'doc',
+      });
+    });
+
+    classExams.slice(0, 2).forEach((exam) => {
+      const ts = new Date(exam.created_at || exam.start_time || '').getTime() || 0;
+      items.push({
+        id: `exam-${exam.id}`,
+        title: `Đề thi "${exam.title}" (${exam.status === 'published' ? 'Đã xuất bản' : 'Bản nháp'})`,
+        timeText: exam.start_time ? formatDate(exam.start_time) : 'Đề thi',
+        ts,
+        tab: 'exams',
+        bg: '#FFF7ED',
+        color: '#D97706',
+        kind: 'exam',
+      });
+    });
+
+    return items.sort((a, b) => b.ts - a.ts).slice(0, 4);
+  }, [exercises, meetings, classDocs, docsAiStatus, classExams, students.length, isLecturer]);
+
+  const classSidebarContext = {
+    classId,
+    className: classInfo?.name || 'Đang tải...',
+    studentCount: isLecturer ? students.length : classInfo?.member_count || 0,
+    isOpenStudents: classInfo?.is_open_students,
+    activeTab,
+    onSelectTab: handleSelectTab,
+    pendingFaceCount: faceSummary?.pending || 0,
+  };
+
   if (loading) {
     return (
       <div className="app-layout">
-        <Sidebar classes={allClasses} currentClassId={classId} />
+        <Sidebar classes={allClasses} currentClassId={classId} classContext={classSidebarContext} />
         <div className={`main-content page-loading ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}><div className="spinner" /></div>
       </div>
     );
   }
 
-  const tabs: { key: Tab; label: string; icon: React.ReactNode }[] = [
-    { key: 'overview', label: 'Tổng quan', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg> },
-    { key: 'exercises', label: 'Bài tập', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg> },
-    { key: 'meetings', label: 'Buổi học', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><polygon points="23 7 16 12 23 17 23 7"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/></svg> },
-    ...(isLecturer ? [{ key: 'students' as Tab, label: 'Học viên', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg> }] : []),
-    { key: 'documents', label: 'Tài liệu lớp', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg> },
-    { key: 'exams', label: '📝 Đề thi', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg> },
-    ...(isLecturer ? [{ key: 'question-bank' as Tab, label: '📚 Ngân hàng câu hỏi', icon: <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg> }] : []),
-  ];
-
   return (
     <div className="app-layout">
-      <Sidebar classes={allClasses} currentClassId={classId} />
+      <Sidebar classes={allClasses} currentClassId={classId} classContext={classSidebarContext} />
       <div className={`main-content ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
         {/* Header */}
         <header className="page-header">
           <div className="page-header-left">
-            <button className="btn btn-ghost btn-icon btn-sm" onClick={() => navigate('/')}>
+            <MobileMenuButton />
+            <button className="btn btn-ghost btn-icon btn-sm" onClick={() => navigate('/')} title="Quay lại Dashboard">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
                 <line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>
               </svg>
@@ -605,7 +833,19 @@ export default function ClassPage() {
               <div className="page-header-breadcrumb">
                 <span className="breadcrumb-link" onClick={() => navigate('/')}>Tổng quan</span>
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12"><polyline points="9 18 15 12 9 6"/></svg>
-                <span>{classInfo?.name}</span>
+                <span
+                  className={activeTab !== 'overview' ? 'breadcrumb-link' : ''}
+                  style={{ color: activeTab === 'overview' ? 'var(--color-text-primary)' : undefined, fontWeight: activeTab === 'overview' ? 600 : 500 }}
+                  onClick={() => activeTab !== 'overview' && handleSelectTab('overview')}
+                >
+                  {classInfo?.name}
+                </span>
+                {activeTab !== 'overview' && (
+                  <>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12"><polyline points="9 18 15 12 9 6"/></svg>
+                    <span style={{ color: 'var(--color-text-primary)', fontWeight: 600 }}>{TAB_LABELS[activeTab]}</span>
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -628,111 +868,360 @@ export default function ClassPage() {
           </div>
         </header>
 
-        {/* Tab Bar */}
-        <div className="tab-bar" style={{ padding: '0 32px' }}>
-          {tabs.map((t) => (
-            <button
-              key={t.key}
-              id={`tab-${t.key}`}
-              className={`tab-bar-item ${activeTab === t.key ? 'active' : ''}`}
-              onClick={() => setActiveTab(t.key)}
-            >
-              {t.icon}{t.label}
-            </button>
-          ))}
-        </div>
-
         {/* Tab Content */}
         <main className="page-content">
           {/* ── OVERVIEW TAB ────────────────────────────────────────── */}
           {activeTab === 'overview' && (
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
-              {/* Class Info Card */}
-              <div className="card">
-                <div className="card-header">
-                  <h3 className="card-title">Thông tin lớp học</h3>
-                  {isLecturer && (
-                    <button
-                      className="btn btn-outline btn-sm"
-                      onClick={() => {
-                        setEditClassNameVal(classInfo?.name || '');
-                        setShowEditClassName(true);
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
+              {/* Class Hero Banner */}
+              <div className="hero-banner" style={{ marginBottom: 0 }}>
+                <div className="hero-banner-content">
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
+                    <div
+                      style={{
+                        width: 48,
+                        height: 48,
+                        borderRadius: 14,
+                        background: 'linear-gradient(135deg, #4F46E5, #6366F1)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        boxShadow: '0 6px 16px rgba(79,70,229,0.3)',
+                        flexShrink: 0,
                       }}
                     >
-                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14">
-                        <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
-                        <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+                      <svg viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" width="24" height="24">
+                        <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z" />
+                        <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z" />
                       </svg>
-                      Đổi tên lớp
-                    </button>
-                  )}
-                </div>
-                <div className="card-body" style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-                  <div>
-                    <div className="text-sm text-muted mb-1">Tên lớp</div>
-                    <div style={{ fontWeight: 600, fontSize: 16 }}>{classInfo?.name}</div>
+                    </div>
+                    <div style={{ minWidth: 0 }}>
+                      <h1 className="hero-banner-title" style={{ marginBottom: 2 }}>
+                        {classInfo?.name}
+                      </h1>
+                      <p className="hero-banner-subtitle">
+                        Giảng viên: {classInfo?.lecturer_name || user?.name} ·{' '}
+                        {isLecturer ? students.length : classInfo?.member_count || 0} học viên
+                      </p>
+                    </div>
                   </div>
-                  <div>
-                    <div className="text-sm text-muted mb-1">Giảng viên phụ trách</div>
-                    <div style={{ fontWeight: 600 }}>{classInfo?.lecturer_name || user?.name}</div>
-                  </div>
-                  <div>
-                    <div className="text-sm text-muted mb-1">Sĩ số học viên</div>
-                    <div style={{ fontWeight: 600 }}>{isLecturer ? students.length : classInfo?.member_count || 0} học viên</div>
-                  </div>
+
                   {isLecturer && (
-                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', paddingTop: 8, borderTop: '1px solid var(--color-border)' }}>
-                      <div>
-                        <div style={{ fontWeight: 600, fontSize: 14 }}>Trạng thái nhận học viên mới</div>
-                        <div className="text-sm text-muted">Bật để cho phép sinh viên tham gia bằng link mời</div>
-                      </div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 14, flexWrap: 'wrap' }}>
+                      <button
+                        className="btn btn-outline btn-sm"
+                        style={{ background: 'var(--color-surface)' }}
+                        onClick={() => {
+                          setEditClassNameVal(classInfo?.name || '');
+                          setShowEditClassName(true);
+                        }}
+                      >
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="13" height="13">
+                          <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7" />
+                          <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z" />
+                        </svg>
+                        Đổi tên lớp
+                      </button>
                       <button
                         className={`btn btn-sm ${classInfo?.is_open_students ? 'btn-primary' : 'btn-outline'}`}
+                        style={!classInfo?.is_open_students ? { background: 'var(--color-surface)' } : undefined}
                         onClick={handleToggleInvite}
+                        title="Bật/tắt cho phép sinh viên tham gia bằng link mời"
                       >
-                        {classInfo?.is_open_students ? '✓ Đang mở' : '✕ Đang khóa'}
+                        {classInfo?.is_open_students ? '✓ Đang mở nhận học viên' : '✕ Đang khóa nhận học viên'}
                       </button>
+                    </div>
+                  )}
+                </div>
+
+                <div className="hero-banner-art" aria-hidden="true">
+                  <svg width="128" height="84" viewBox="0 0 128 84" fill="none">
+                    <rect x="20" y="18" width="76" height="50" rx="10" fill="#4F46E5" fillOpacity="0.16" />
+                    <rect x="30" y="12" width="72" height="48" rx="8" fill="#4F46E5" />
+                    <rect x="38" y="22" width="32" height="6" rx="3" fill="white" fillOpacity="0.85" />
+                    <rect x="38" y="33" width="52" height="4" rx="2" fill="white" fillOpacity="0.45" />
+                    <rect x="38" y="42" width="42" height="4" rx="2" fill="white" fillOpacity="0.45" />
+                    <circle cx="96" cy="58" r="14" fill="#10B981" />
+                    <path d="M90 58L94 62L102 54" stroke="white" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </div>
+              </div>
+
+              {/* 4 Quick Stat Cards */}
+              <div className="kpi-grid" style={{ marginBottom: 0 }}>
+                <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => handleSelectTab('exercises')}>
+                  <div className="kpi-icon" style={{ background: '#EEF2FF' }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="#4F46E5" strokeWidth="2" width="22" height="22">
+                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                      <polyline points="14 2 14 8 20 8" />
+                    </svg>
+                  </div>
+                  <div className="kpi-body">
+                    <div className="kpi-top">
+                      <span className="kpi-value">{exercises.length}</span>
+                      <span className="kpi-trend info">{classProgress.exercisePct}%</span>
+                    </div>
+                    <div className="kpi-label">Bài tập được giao</div>
+                  </div>
+                </div>
+
+                <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => handleSelectTab('meetings')}>
+                  <div className="kpi-icon" style={{ background: '#EFF6FF' }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="#3B82F6" strokeWidth="2" width="22" height="22">
+                      <polygon points="23 7 16 12 23 17 23 7" />
+                      <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+                    </svg>
+                  </div>
+                  <div className="kpi-body">
+                    <div className="kpi-top">
+                      <span className="kpi-value">{meetings.length}</span>
+                      <span className="kpi-trend info">{classProgress.meetingPct}%</span>
+                    </div>
+                    <div className="kpi-label">Buổi học trực tuyến</div>
+                  </div>
+                </div>
+
+                <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => handleSelectTab('documents')}>
+                  <div className="kpi-icon" style={{ background: '#ECFDF5' }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="#10B981" strokeWidth="2" width="22" height="22">
+                      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                    </svg>
+                  </div>
+                  <div className="kpi-body">
+                    <div className="kpi-top">
+                      <span className="kpi-value">{classDocs.length}</span>
+                      <span className="kpi-trend up">{classProgress.docPct}% AI</span>
+                    </div>
+                    <div className="kpi-label">Tài liệu lớp học</div>
+                  </div>
+                </div>
+
+                <div className="kpi-card" style={{ cursor: 'pointer' }} onClick={() => handleSelectTab('exams')}>
+                  <div className="kpi-icon" style={{ background: '#FFF7ED' }}>
+                    <svg viewBox="0 0 24 24" fill="none" stroke="#F59E0B" strokeWidth="2" width="22" height="22">
+                      <path d="M9 11l3 3L22 4" />
+                      <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+                    </svg>
+                  </div>
+                  <div className="kpi-body">
+                    <div className="kpi-top">
+                      <span className="kpi-value">{classExams.length}</span>
+                      <span className="kpi-trend info">
+                        {classExams.filter((e) => e.status === 'published').length} đang mở
+                      </span>
+                    </div>
+                    <div className="kpi-label">Đề thi & Kiểm tra</div>
+                  </div>
+                </div>
+              </div>
+
+              {/* 2-Column Analytics: Tiến độ lớp học + Hoạt động gần đây */}
+              <div className="analytics-grid-2" style={{ marginBottom: 0 }}>
+                {/* Tiến độ lớp học */}
+                <div className="widget-card">
+                  <div className="widget-header">
+                    <h3 className="widget-title">Tiến độ lớp học</h3>
+                    <span className="badge badge-primary">Tổng hợp</span>
+                  </div>
+                  <div className="donut-wrap" style={{ padding: '8px 0' }}>
+                    {(() => {
+                      const r = 52;
+                      const c = 2 * Math.PI * r;
+                      const dash = (classProgress.overallPct / 100) * c;
+                      return (
+                        <svg width="136" height="136" viewBox="0 0 136 136">
+                          <defs>
+                            <linearGradient id="classProgressGrad" x1="0" y1="0" x2="1" y2="1">
+                              <stop offset="0%" stopColor="#4F46E5" />
+                              <stop offset="60%" stopColor="#3B82F6" />
+                              <stop offset="100%" stopColor="#10B981" />
+                            </linearGradient>
+                          </defs>
+                          <circle
+                            cx="68"
+                            cy="68"
+                            r={r}
+                            fill="none"
+                            stroke="var(--color-border-subtle)"
+                            strokeWidth="13"
+                          />
+                          <circle
+                            cx="68"
+                            cy="68"
+                            r={r}
+                            fill="none"
+                            stroke="url(#classProgressGrad)"
+                            strokeWidth="13"
+                            strokeDasharray={`${dash} ${c - dash}`}
+                            strokeLinecap="round"
+                            transform="rotate(-90 68 68)"
+                          />
+                          <text
+                            x="68"
+                            y="64"
+                            textAnchor="middle"
+                            fontSize="24"
+                            fontWeight="800"
+                            fill="var(--color-text-primary)"
+                          >
+                            {classProgress.overallPct}%
+                          </text>
+                          <text
+                            x="68"
+                            y="82"
+                            textAnchor="middle"
+                            fontSize="11.5"
+                            fill="var(--color-text-muted)"
+                          >
+                            Hoàn thành
+                          </text>
+                        </svg>
+                      );
+                    })()}
+
+                    <div className="donut-legend" style={{ minWidth: 160 }}>
+                      <div className="donut-legend-row">
+                        <span className="chart-legend-item">
+                          <span className="chart-legend-dot" style={{ background: '#4F46E5' }} />
+                          Bài tập
+                        </span>
+                        <strong style={{ color: 'var(--color-text-primary)' }}>{classProgress.exercisePct}%</strong>
+                      </div>
+                      <div className="donut-legend-row">
+                        <span className="chart-legend-item">
+                          <span className="chart-legend-dot" style={{ background: '#3B82F6' }} />
+                          Buổi học
+                        </span>
+                        <strong style={{ color: 'var(--color-text-primary)' }}>{classProgress.meetingPct}%</strong>
+                      </div>
+                      <div className="donut-legend-row">
+                        <span className="chart-legend-item">
+                          <span className="chart-legend-dot" style={{ background: '#10B981' }} />
+                          Tài liệu AI
+                        </span>
+                        <strong style={{ color: 'var(--color-text-primary)' }}>{classProgress.docPct}%</strong>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Hoạt động gần đây */}
+                <div className="widget-card">
+                  <div className="widget-header">
+                    <h3 className="widget-title">Hoạt động gần đây</h3>
+                    <span className="widget-link" onClick={() => handleSelectTab('exercises')}>
+                      Xem bài tập →
+                    </span>
+                  </div>
+
+                  {recentActivities.length === 0 ? (
+                    <div
+                      style={{
+                        flex: 1,
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        color: 'var(--color-text-muted)',
+                        fontSize: 13,
+                        padding: '24px 0',
+                      }}
+                    >
+                      Chưa có hoạt động nào trong lớp học này
+                    </div>
+                  ) : (
+                    <div className="activity-list">
+                      {recentActivities.map((act) => (
+                        <div
+                          key={act.id}
+                          className="activity-item"
+                          onClick={() => handleSelectTab(act.tab)}
+                        >
+                          <div className="activity-icon" style={{ background: act.bg, color: act.color }}>
+                            {act.kind === 'exercise' && (
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                                <polyline points="14 2 14 8 20 8" />
+                              </svg>
+                            )}
+                            {act.kind === 'meeting' && (
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
+                                <polygon points="23 7 16 12 23 17 23 7" />
+                                <rect x="1" y="5" width="15" height="14" rx="2" ry="2" />
+                              </svg>
+                            )}
+                            {act.kind === 'doc' && (
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
+                                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
+                              </svg>
+                            )}
+                            {act.kind === 'exam' && (
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="16" height="16">
+                                <path d="M9 11l3 3L22 4" />
+                                <path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11" />
+                              </svg>
+                            )}
+                          </div>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div
+                              className="truncate"
+                              style={{ fontSize: 13, fontWeight: 600, color: 'var(--color-text-primary)' }}
+                            >
+                              {act.title}
+                            </div>
+                          </div>
+                          <span style={{ fontSize: 11.5, color: 'var(--color-text-muted)', whiteSpace: 'nowrap' }}>
+                            {act.timeText}
+                          </span>
+                        </div>
+                      ))}
                     </div>
                   )}
                 </div>
               </div>
 
-              {/* Stats Column */}
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-                <div className="stat-card">
-                  <div className="stat-icon" style={{ background: '#EEF2FF' }}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="#4F46E5" strokeWidth="2">
-                      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                      <polyline points="14 2 14 8 20 8"/>
+              {/* AI Hỗ trợ giảng dạy / Trợ giảng AI Banner */}
+              <div className="ai-promo-banner">
+                <div className="ai-promo-left">
+                  <div className="ai-promo-icon">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" width="22" height="22">
+                      <path d="M22 10v6M2 10l10-5 10 5-10 5z" />
+                      <path d="M6 12v5c3 3 9 3 12 0v-5" />
                     </svg>
                   </div>
-                  <div className="stat-body">
-                    <div className="stat-value">{exercises.length}</div>
-                    <div className="stat-label">Bài tập được giao</div>
+                  <div>
+                    <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 2 }}>
+                      {isLecturer ? 'AI Hỗ trợ giảng dạy' : 'Trợ giảng AI (RAG)'}
+                    </div>
+                    <div style={{ fontSize: 13, color: 'rgba(255,255,255,0.88)' }}>
+                      {isLecturer
+                        ? 'Tạo câu hỏi trắc nghiệm từ tài liệu bằng AI, hỏi đáp giáo trình có trích dẫn và giám sát thi thông minh.'
+                        : 'Hỏi đáp trực tiếp nội dung bài giảng, giáo trình của lớp học kèm trích dẫn nguồn chính xác.'}
+                    </div>
                   </div>
                 </div>
-                <div className="stat-card">
-                  <div className="stat-icon" style={{ background: '#EFF6FF' }}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="#3B82F6" strokeWidth="2">
-                      <polygon points="23 7 16 12 23 17 23 7"/>
-                      <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
-                    </svg>
-                  </div>
-                  <div className="stat-body">
-                    <div className="stat-value">{meetings.length}</div>
-                    <div className="stat-label">Buổi học trực tuyến</div>
-                  </div>
-                </div>
-                <div className="stat-card">
-                  <div className="stat-icon" style={{ background: '#F0FDF4' }}>
-                    <svg viewBox="0 0 24 24" fill="none" stroke="#10B981" strokeWidth="2">
-                      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-                    </svg>
-                  </div>
-                  <div className="stat-body">
-                    <div className="stat-value">{classDocs.length}</div>
-                    <div className="stat-label">Tài liệu lớp học</div>
-                  </div>
+                <div className="flex gap-2">
+                  {isLecturer && (
+                    <button
+                      type="button"
+                      className="btn btn-sm"
+                      style={{
+                        background: 'rgba(255,255,255,0.16)',
+                        color: '#ffffff',
+                        border: '1px solid rgba(255,255,255,0.3)',
+                      }}
+                      onClick={() => handleSelectTab('question-bank')}
+                    >
+                      Tạo câu hỏi AI
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    style={{ background: '#ffffff', color: '#4F46E5', fontWeight: 700 }}
+                    onClick={() => setShowRagDrawer(true)}
+                  >
+                    Khám phá ngay →
+                  </button>
                 </div>
               </div>
             </div>
@@ -913,14 +1402,48 @@ export default function ClassPage() {
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
                   {meetings.map((m) => {
                     const d = new Date(m.start_time);
+                    const now = new Date();
+                    const isEnded = m.status === 'ended' || now > new Date(m.end_time);
+                    const isStarted = !isEnded && now >= new Date(m.start_time);
                     return (
-                      <div key={m.id} id={`meeting-${m.id}`} className="meeting-card">
+                      <div
+                        key={m.id}
+                        id={`meeting-${m.id}`}
+                        className="meeting-card"
+                        style={{ opacity: isEnded ? 0.78 : 1 }}
+                      >
                         <div className="meeting-card-time">
                           <div className="date">{d.getDate()}</div>
                           <div className="month">Tháng {d.getMonth() + 1}</div>
                         </div>
                         <div className="meeting-card-info">
-                          <div className="meeting-card-name">{m.name}</div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                            <div className="meeting-card-name">{m.name}</div>
+                            <span
+                              style={{
+                                padding: '2px 8px',
+                                borderRadius: 9999,
+                                fontSize: 11,
+                                fontWeight: 700,
+                                background: isEnded
+                                  ? '#F1F5F9'
+                                  : isStarted
+                                    ? '#DCFCE7'
+                                    : '#EEF2FF',
+                                color: isEnded
+                                  ? '#64748B'
+                                  : isStarted
+                                    ? '#15803D'
+                                    : '#4F46E5',
+                              }}
+                            >
+                              {isEnded
+                                ? 'Đã kết thúc'
+                                : isStarted
+                                  ? '● Đang diễn ra'
+                                  : 'Sắp diễn ra'}
+                            </span>
+                          </div>
                           <div className="meeting-card-time-range">
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="12" height="12">
                               <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
@@ -931,15 +1454,32 @@ export default function ClassPage() {
                         </div>
                         <div className="flex items-center gap-2">
                           <button
-                            className="btn btn-primary btn-sm"
+                            className={`btn btn-sm ${isEnded ? 'btn-secondary' : 'btn-primary'}`}
                             id={`btn-join-meeting-${m.id}`}
-                            onClick={() => navigate(`/class/${classId}/meet/${m.meeting_code}`)}
+                            disabled={isEnded}
+                            title={
+                              isEnded
+                                ? 'Buổi học đã quá thời gian kết thúc, không thể tham gia'
+                                : 'Tham gia phòng học trực tuyến'
+                            }
+                            style={{
+                              cursor: isEnded ? 'not-allowed' : 'pointer',
+                              opacity: isEnded ? 0.65 : 1,
+                            }}
+                            onClick={() => {
+                              if (new Date() > new Date(m.end_time) || m.status === 'ended') {
+                                alert('Buổi học này đã quá thời gian kết thúc, không thể tham gia.');
+                                void reloadMeetings();
+                                return;
+                              }
+                              navigate(`/class/${classId}/meet/${m.meeting_code}`);
+                            }}
                           >
                             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" width="14" height="14">
                               <polygon points="23 7 16 12 23 17 23 7"/>
                               <rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
                             </svg>
-                            Vào phòng học
+                            {isEnded ? 'Đã kết thúc' : 'Vào phòng học'}
                           </button>
                           {isLecturer && (
                             <>
@@ -1057,8 +1597,62 @@ export default function ClassPage() {
           {/* ── DOCUMENTS TAB ───────────────────────────────────────── */}
           {activeTab === 'documents' && (
             <div>
-              <div className="flex items-center justify-between mb-4">
-                <h2 style={{ fontSize: 16, fontWeight: 700 }}>Tài liệu lớp học ({classDocs.length})</h2>
+              {aiToastMsg && (
+                <div
+                  style={{
+                    marginBottom: 14,
+                    padding: '10px 14px',
+                    borderRadius: 10,
+                    background: '#EEF2FF',
+                    border: '1px solid #C7D2FE',
+                    color: '#4338CA',
+                    fontSize: 13,
+                    fontWeight: 600,
+                  }}
+                >
+                  ✨ {aiToastMsg}
+                </div>
+              )}
+
+              <div className="flex items-center justify-between mb-4" style={{ flexWrap: 'wrap', gap: 10 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                  <h2 style={{ fontSize: 16, fontWeight: 700, margin: 0 }}>
+                    Tài liệu lớp học ({classDocs.length})
+                  </h2>
+                  <button
+                    type="button"
+                    disabled={classDocs.length === 0}
+                    onClick={() => setShowRagDrawer(true)}
+                    title={
+                      classDocs.length === 0
+                        ? 'Lớp học chưa có tài liệu để hỏi đáp AI'
+                        : 'Mở Trợ giảng AI hỏi đáp tài liệu lớp học'
+                    }
+                    style={{
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 7,
+                      padding: '8px 14px',
+                      borderRadius: 10,
+                      border: 'none',
+                      background:
+                        classDocs.length === 0
+                          ? '#CBD5E1'
+                          : 'linear-gradient(135deg, #4F46E5 0%, #7C3AED 100%)',
+                      color: '#FFFFFF',
+                      fontSize: 13,
+                      fontWeight: 700,
+                      boxShadow:
+                        classDocs.length === 0
+                          ? 'none'
+                          : '0 4px 12px rgba(79, 70, 229, 0.25)',
+                      cursor: classDocs.length === 0 ? 'not-allowed' : 'pointer',
+                    }}
+                  >
+                    💬 Hỏi đáp tài liệu (AI)
+                  </button>
+                </div>
+
                 {isLecturer && (
                   <button id="btn-manage-class-docs" className="btn btn-primary" onClick={openManageDocsModal}>
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" width="14" height="14">
@@ -1092,37 +1686,176 @@ export default function ClassPage() {
                         {catName}
                         <span className="badge badge-neutral" style={{ fontSize: 11 }}>{docs.length} tệp</span>
                       </h3>
-                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 10 }}>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(290px, 1fr))', gap: 10 }}>
                         {docs.map((doc) => {
                           const name = getDisplayFileName(doc.file_name);
+                          const st = docsAiStatus.find((s) => s.docId === doc.doc_id);
+                          const status = st?.status || 'pending';
                           return (
-                            <a
+                            <div
                               key={doc.doc_id}
-                              href={getFileUrl(doc.file_name)}
-                              target="_blank"
-                              rel="noreferrer"
                               style={{
+                                position: 'relative',
                                 display: 'flex',
                                 alignItems: 'center',
-                                gap: 10,
-                                padding: '10px 14px',
+                                justifyContent: 'space-between',
+                                gap: 8,
+                                padding: '10px 12px',
                                 background: 'var(--color-bg)',
-                                borderRadius: 8,
+                                borderRadius: 10,
                                 border: '1px solid var(--color-border)',
-                                color: 'var(--color-text-primary)',
-                                textDecoration: 'none',
-                                fontSize: 13,
-                                fontWeight: 500,
                               }}
                             >
-                              <svg viewBox="0 0 24 24" fill="none" stroke="#4F46E5" strokeWidth="2" width="16" height="16" style={{ flexShrink: 0 }}>
-                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                                <polyline points="14 2 14 8 20 8"/>
-                              </svg>
-                              <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                {name}
-                              </span>
-                            </a>
+                              <a
+                                href={getFileUrl(doc.file_name)}
+                                target="_blank"
+                                rel="noreferrer"
+                                style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: 8,
+                                  color: 'var(--color-text-primary)',
+                                  textDecoration: 'none',
+                                  fontSize: 13,
+                                  fontWeight: 600,
+                                  flex: 1,
+                                  minWidth: 0,
+                                }}
+                                title={name}
+                              >
+                                <svg viewBox="0 0 24 24" fill="none" stroke="#4F46E5" strokeWidth="2" width="16" height="16" style={{ flexShrink: 0 }}>
+                                  <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                  <polyline points="14 2 14 8 20 8"/>
+                                </svg>
+                                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {name}
+                                </span>
+                              </a>
+
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexShrink: 0 }}>
+                                <span
+                                  title={st?.errorMessage || undefined}
+                                  style={{
+                                    padding: '2px 8px',
+                                    borderRadius: 9999,
+                                    fontSize: 11,
+                                    fontWeight: 700,
+                                    background:
+                                      status === 'ready'
+                                        ? '#DCFCE7'
+                                        : status === 'failed'
+                                          ? '#FEE2E2'
+                                          : status === 'unsupported'
+                                            ? '#F1F5F9'
+                                            : '#FEF3C7',
+                                    color:
+                                      status === 'ready'
+                                        ? '#15803D'
+                                        : status === 'failed'
+                                          ? '#B91C1C'
+                                          : status === 'unsupported'
+                                            ? '#64748B'
+                                            : '#B45309',
+                                  }}
+                                >
+                                  {status === 'ready'
+                                    ? '✅ Sẵn sàng'
+                                    : status === 'failed'
+                                      ? st?.errorCode === 'scanned_pdf'
+                                        ? '⚠️ PDF scan'
+                                        : st?.errorCode === 'missing_api_key'
+                                          ? '⏳ Chờ API Key'
+                                          : '⚠️ Lỗi'
+                                      : status === 'unsupported'
+                                        ? '⚪ Không hỗ trợ'
+                                        : '⏳ Đang xử lý'}
+                                </span>
+
+                                {isLecturer && (
+                                  <div style={{ position: 'relative' }}>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        setOpenDocMenuId((prev) =>
+                                          prev === doc.doc_id ? null : doc.doc_id,
+                                        )
+                                      }
+                                      style={{
+                                        border: 'none',
+                                        background: 'transparent',
+                                        cursor: 'pointer',
+                                        padding: '2px 6px',
+                                        borderRadius: 6,
+                                        fontSize: 15,
+                                        fontWeight: 700,
+                                        color: '#64748B',
+                                      }}
+                                      title="Tác vụ AI"
+                                    >
+                                      ⋮
+                                    </button>
+
+                                    {openDocMenuId === doc.doc_id && (
+                                      <div
+                                        style={{
+                                          position: 'absolute',
+                                          top: 'calc(100% + 4px)',
+                                          right: 0,
+                                          width: 230,
+                                          background: '#FFFFFF',
+                                          border: '1px solid #E2E8F0',
+                                          borderRadius: 10,
+                                          boxShadow: '0 10px 25px rgba(15, 23, 42, 0.14)',
+                                          padding: 6,
+                                          zIndex: 80,
+                                        }}
+                                      >
+                                        {status === 'ready' && (
+                                          <button
+                                            type="button"
+                                            onClick={() => handleOpenAiQuestionFromDoc(doc.doc_id)}
+                                            style={{
+                                              width: '100%',
+                                              textAlign: 'left',
+                                              padding: '8px 10px',
+                                              border: 'none',
+                                              background: 'transparent',
+                                              borderRadius: 6,
+                                              fontSize: 12.5,
+                                              fontWeight: 600,
+                                              color: '#4F46E5',
+                                              cursor: 'pointer',
+                                            }}
+                                          >
+                                            ✨ Tạo câu hỏi từ tài liệu này
+                                          </button>
+                                        )}
+                                        {status !== 'unsupported' && (
+                                          <button
+                                            type="button"
+                                            onClick={() => void handleReindexDoc(doc.doc_id)}
+                                            style={{
+                                              width: '100%',
+                                              textAlign: 'left',
+                                              padding: '8px 10px',
+                                              border: 'none',
+                                              background: 'transparent',
+                                              borderRadius: 6,
+                                              fontSize: 12.5,
+                                              fontWeight: 500,
+                                              color: '#334155',
+                                              cursor: 'pointer',
+                                            }}
+                                          >
+                                            🔄 Lập chỉ mục lại
+                                          </button>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
                           );
                         })}
                       </div>
@@ -1130,6 +1863,15 @@ export default function ClassPage() {
                   ))}
                 </div>
               )}
+
+              <RagChatDrawer
+                open={showRagDrawer}
+                onClose={() => setShowRagDrawer(false)}
+                classId={classId}
+                className={classInfo?.name || `Lớp #${classId}`}
+                docsStatus={docsAiStatus}
+                geminiConfigured={geminiConfigured}
+              />
             </div>
           )}
 
@@ -1148,6 +1890,16 @@ export default function ClassPage() {
           {activeTab === 'question-bank' && isLecturer && (
             <div>
               <QuestionBankTab classId={String(classId)} />
+            </div>
+          )}
+
+          {/* ── FACE PROFILES TAB (LECTURER) ───────────────────────── */}
+          {activeTab === 'face-profiles' && isLecturer && (
+            <div>
+              <ClassFaceProfilesTab
+                classId={classId}
+                onSummaryChange={(sum) => setFaceSummary(sum)}
+              />
             </div>
           )}
         </main>

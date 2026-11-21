@@ -1,5 +1,6 @@
 import { query, queryOne } from '../config/database.js';
 import { ClassRow, ClassWithMeta } from '../models/types.js';
+import { enqueueDocumentIngestion } from './ai/ingestion.service.js';
 
 export async function createClass(
   lecturerId: number,
@@ -189,6 +190,9 @@ export async function attachFileToClass(
     'INSERT INTO class_attach_files (class_id, doc_id) VALUES ($1, $2) ON CONFLICT DO NOTHING',
     [classId, docId]
   );
+  void enqueueDocumentIngestion(docId).catch((err) => {
+    console.warn(`[ai-ingest] Không thể xếp hàng index cho doc #${docId}:`, err?.message);
+  });
 }
 
 export async function removeAttachFileFromClass(

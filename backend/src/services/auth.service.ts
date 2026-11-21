@@ -163,3 +163,58 @@ export async function deleteRefreshToken(token: string): Promise<void> {
 export async function deleteAllUserRefreshTokens(userId: number): Promise<void> {
   await query('DELETE FROM refresh_tokens WHERE user_id = $1', [userId]);
 }
+
+export async function getUserProfileInfo(userId: number) {
+  const row = await queryOne<{
+    id: number;
+    name: string;
+    is_lecturer: boolean;
+    login_id: string | null;
+  }>(
+    `SELECT u.id, u.name, u.is_lecturer, ul.login_id
+       FROM users u
+       LEFT JOIN user_login_id ul ON ul.user_id = u.id
+      WHERE u.id = $1`,
+    [userId],
+  );
+  if (!row) return null;
+  return {
+    userId: row.id,
+    name: row.name,
+    isLecturer: row.is_lecturer,
+    loginId: row.login_id ?? '',
+  };
+}
+
+export async function changeUserPassword(
+  userId: number,
+  currentPassword: string,
+  newPassword: string,
+): Promise<void> {
+  if (!currentPassword || !newPassword) {
+    throw new Error('Vui lòng nhập đầy đủ mật khẩu hiện tại và mật khẩu mới');
+  }
+  if (newPassword.length < 6) {
+    throw new Error('Mật khẩu mới phải có ít nhất 6 ký tự');
+  }
+  if (currentPassword === newPassword) {
+    throw new Error('Mật khẩu mới phải khác mật khẩu hiện tại');
+  }
+
+  const userRow = await queryOne<{ id: number; password: string }>(
+    'SELECT id, password FROM users WHERE id = $1',
+    [userId],
+  );
+  if (!userRow) {
+    throw new Error('Không tìm thấy tài khoản người dùng');
+  }
+
+  const isMatch = await bcrypt.compare(currentPassword, userRow.password);
+  if (!isMatch) {
+    throw new Error('Mật khẩu hiện tại không chính xác');
+  }
+
+  const hashedNewPassword = await bcrypt.hash(newPassword, SALT_ROUNDS);
+  await query('UPDATE users SET password = $2 WHERE id = $1', [userId, hashedNewPassword]);
+}
+

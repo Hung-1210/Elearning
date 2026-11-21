@@ -20,8 +20,8 @@ import {
   FiLayers,
   FiLock,
 } from 'react-icons/fi';
-import { examApi } from '../../api';
-import type { Exam } from '../../types';
+import { examApi, faceProfileApi } from '../../api';
+import type { Exam, ClassFaceProfileSummary } from '../../types';
 import { toLocalDatetimeInputValue } from './examUtils';
 import './exam.css';
 
@@ -49,9 +49,14 @@ export const TeacherExamListTab: React.FC<TeacherExamListTabProps> = ({ classId 
     p50Ms: number | null;
     reason?: string;
   }>({ ready: false, p50Ms: null });
+  const [faceSummary, setFaceSummary] = useState<ClassFaceProfileSummary | null>(null);
 
   useEffect(() => {
     void loadExams();
+    faceProfileApi
+      .listForClass(classId)
+      .then((res) => setFaceSummary(res.data.data?.summary || null))
+      .catch(() => {});
     examApi
       .getAiStatus()
       .then((res) => {
@@ -309,6 +314,18 @@ export const TeacherExamListTab: React.FC<TeacherExamListTabProps> = ({ classId 
         </div>
 
         <div className="header-action-group">
+          <button
+            type="button"
+            className="btn-secondary-exam"
+            onClick={() => navigate(`/class/${classId}?tab=face-profiles`)}
+          >
+            👤 Khuôn mặt SV{' '}
+            {faceSummary
+              ? `(${faceSummary.approved}/${faceSummary.total} đã duyệt${
+                  faceSummary.pending > 0 ? ` • ${faceSummary.pending} chờ` : ''
+                })`
+              : ''}
+          </button>
           <button
             type="button"
             className="btn-secondary-exam"

@@ -15,9 +15,16 @@ import classRoutes from './routes/class.routes.js';
 import exerciseRoutes from './routes/exercise.routes.js';
 import documentRoutes from './routes/document.routes.js';
 import meetingRoutes from './routes/meeting.routes.js';
+import { getMeetingByCode } from './services/meeting.service.js';
 import examRoutes from './routes/exam.routes.js';
+import faceAttendanceRoutes from './routes/face-attendance.routes.js';
+import aiRoutes from './routes/ai.routes.js';
 import { registerMonitorNamespace } from './sockets/monitor.socket.js';
+import { registerMeetingIo } from './sockets/attendance.socket.js';
+import { ensureFaceAttendanceTables } from './services/face-profile.service.js';
+import { ensureAiRagTables } from './services/ai/schema.js';
 import { startProctoringJobs } from './jobs/proctoring.jobs.js';
+import { startAiJobs } from './jobs/ai.jobs.js';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3001');
@@ -27,7 +34,7 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 app.use(cors({
   origin: [FRONTEND_URL, 'https://localhost:5173'],
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 app.use(express.json({ limit: '10mb' }));
@@ -49,6 +56,8 @@ app.use('/api/classes', classRoutes);
 app.use('/api/exercises', exerciseRoutes);
 app.use('/api/documents', documentRoutes);
 app.use('/api/meetings', meetingRoutes);
+app.use('/api', faceAttendanceRoutes);
+app.use('/api', aiRoutes);
 app.use('/api', examRoutes);
 
 // Health check
@@ -82,8 +91,9 @@ const io = new SocketIOServer(server, {
   },
 });
 
-// Register proctoring monitor namespace
+// Register proctoring monitor namespace & meeting attendance io
 registerMonitorNamespace(io);
+registerMeetingIo(io);
 
 // Track participants per room: roomId → Map<socketId, { userId, userName }>
 const rooms = new Map<string, Map<string, { userId: string; userName: string }>>();
@@ -113,7 +123,20 @@ io.on('connection', (socket) => {
     io.to(roomId).emit('room-participants', getRoomParticipants(roomId));
   };
 
-  socket.on('join-room', (roomId: string, userId: string, userName: string) => {
+  socket.on('join-room', async (roomId: string, userId: string, userName: string) => {
+    try {
+      const meeting = await getMeetingByCode(roomId);
+      if (meeting && new Date() > new Date(meeting.end_time)) {
+        socket.emit('room-ended', {
+          message: 'Buổi học này đã quá thời gian kết thúc, không thể tham gia vào phòng.',
+          endTime: meeting.end_time,
+        });
+        return;
+      }
+    } catch {
+      // Nếu lỗi truy vấn tạm thời thì không chặn cứng
+    }
+
     // Rời phòng cũ nếu socket này đã join phòng khác
     if (joinedRoomId && joinedRoomId !== roomId) {
       removeFromRoom(joinedRoomId);
@@ -173,8 +196,11 @@ io.on('connection', (socket) => {
 async function start() {
   try {
     await testConnection();
-    // Start background proctoring jobs (auto submit & evidence cleanup)
+    await ensureFaceAttendanceTables();
+    await ensureAiRagTables();
+    // Start background proctoring & AI ingestion jobs
     startProctoringJobs();
+    startAiJobs();
 
     server.listen(PORT, () => {
       const ip = getWifiIP();

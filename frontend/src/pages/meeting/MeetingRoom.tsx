@@ -3,10 +3,16 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { io, Socket } from 'socket.io-client';
 import {
   FiMic, FiMicOff, FiVideo, FiVideoOff, FiMonitor, FiMessageSquare,
-  FiUsers, FiPhoneOff, FiX, FiSend, FiCopy, FiCheck,
+  FiUsers, FiPhoneOff, FiX, FiSend, FiCopy, FiCheck, FiUserCheck,
 } from 'react-icons/fi';
 import { MdOutlinePanTool, MdPanTool, MdPushPin, MdOutlinePushPin } from 'react-icons/md';
 import { useAuthStore } from '../../store/authStore';
+import { attendanceApi, meetingApi } from '../../api';
+import type { AttendanceRecord, AttendanceSession } from '../../types';
+import {
+  LecturerAttendanceSidePanel,
+  StudentAttendanceFloatingCard,
+} from './MeetingAttendancePanel';
 
 const SOCKET_URL = import.meta.env.VITE_API_URL?.replace('/api', '') || 'http://localhost:3001';
 const ICE_SERVERS: RTCConfiguration = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
@@ -96,6 +102,7 @@ export default function MeetingRoom() {
   const [chatOpen, setChatOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [showParticipants, setShowParticipants] = useState(false);
+  const [showAttendancePanel, setShowAttendancePanel] = useState(false);
   const [peerCamOff, setPeerCamOff] = useState<Set<string>>(new Set());
   const [pinnedPeer, setPinnedPeer] = useState<string | null>(null);
   const [peerSharing, setPeerSharing] = useState<Set<string>>(new Set());
@@ -105,6 +112,38 @@ export default function MeetingRoom() {
   const [copied, setCopied] = useState(false);
   const stageRef = useRef<HTMLDivElement>(null);
   const [stageSize, setStageSize] = useState({ w: 0, h: 0 });
+
+  // Face Attendance state
+  const [activeAttendanceSession, setActiveAttendanceSession] = useState<AttendanceSession | null>(null);
+  const [myOverviewRecord, setMyOverviewRecord] = useState<AttendanceRecord | null>(null);
+  const [classProfileSummary, setClassProfileSummary] = useState<{
+    totalStudents: number;
+    approvedCount: number;
+    pendingCount: number;
+    rejectedCount: number;
+    unregisteredCount: number;
+  } | null>(null);
+  const [reminderPulse, setReminderPulse] = useState(0);
+  const [roomEndedMessage, setRoomEndedMessage] = useState<string | null>(null);
+
+  const refreshAttendanceOverview = useCallback(async () => {
+    if (!meetingCode) return;
+    try {
+      const res = await attendanceApi.getOverview(meetingCode, classId);
+      const d = res.data.data;
+      setActiveAttendanceSession(d.session || null);
+      setMyOverviewRecord(d.myRecord || null);
+      if (d.classProfileSummary) {
+        setClassProfileSummary(d.classProfileSummary);
+      }
+    } catch {
+      // ignore
+    }
+  }, [meetingCode, classId]);
+
+  useEffect(() => {
+    refreshAttendanceOverview();
+  }, [refreshAttendanceOverview]);
   const micOnRef = useRef(true);
   useEffect(() => { micOnRef.current = micOn; }, [micOn]);
   useEffect(() => {
@@ -264,6 +303,24 @@ export default function MeetingRoom() {
     let mounted = true;
 
     const init = async () => {
+      // Kiểm tra thời gian kết thúc của phòng học trước khi bật camera/mic và kết nối WebRTC
+      if (meetingCode) {
+        try {
+          const res = await meetingApi.getByCode(meetingCode);
+          const m = res.data?.data;
+          if (m && (m.status === 'ended' || new Date() > new Date(m.end_time))) {
+            if (mounted) {
+              setRoomEndedMessage(
+                `Buổi học "${m.name}" đã qua thời gian kết thúc (${new Date(m.end_time).toLocaleString('vi-VN')}), bạn không thể tham gia vào phòng học nữa.`,
+              );
+            }
+            return;
+          }
+        } catch {
+          // Tiếp tục nếu không lấy được thông tin
+        }
+      }
+
       // Get local media — ALWAYS ensure stream has video+audio tracks
       // (even if placeholders) so SDP has media descriptions for peer connections
       let stream: MediaStream;
@@ -307,6 +364,17 @@ export default function MeetingRoom() {
         if (!mounted) return;
         // Join room with socket.id as the signaling ID, plus user info for display
         sock.emit('join-room', meetingCode, user?.userId?.toString() || sock.id, user?.name || 'Ẩn danh');
+      });
+
+      sock.on('room-ended', (payload?: { message?: string }) => {
+        if (!mounted) return;
+        localStreamRef.current?.getTracks().forEach((t) => t.stop());
+        screenStreamRef.current?.getTracks().forEach((t) => t.stop());
+        sock.disconnect();
+        setRoomEndedMessage(
+          payload?.message ||
+            'Buổi học này đã quá thời gian kết thúc, không thể tham gia vào phòng.',
+        );
       });
 
       // Receive updated participant list from server
@@ -385,6 +453,39 @@ export default function MeetingRoom() {
           timestamp: m.timestamp || Date.now(),
         }]);
         setUnreadChat(prev => (chatOpenRef.current ? 0 : prev + 1));
+      });
+
+      // Face Attendance real-time events
+      sock.on('attendance-started', (payload: { session?: AttendanceSession }) => {
+        if (!mounted) return;
+        if (payload?.session) {
+          setActiveAttendanceSession(payload.session);
+        }
+        refreshAttendanceOverview();
+      });
+
+      sock.on('attendance-update', (payload: { session?: AttendanceSession }) => {
+        if (!mounted) return;
+        if (payload?.session) {
+          setActiveAttendanceSession(payload.session);
+        }
+        refreshAttendanceOverview();
+      });
+
+      sock.on('attendance-ended', (payload: { session?: AttendanceSession }) => {
+        if (!mounted) return;
+        if (payload?.session) {
+          setActiveAttendanceSession(payload.session);
+        }
+        refreshAttendanceOverview();
+      });
+
+      sock.on('attendance-reminder', (payload: { missingStudentIds?: number[] }) => {
+        if (!mounted) return;
+        const myId = Number(user?.userId || 0);
+        if (!user?.isLecturer && payload?.missingStudentIds?.includes(myId)) {
+          setReminderPulse((p) => p + 1);
+        }
       });
 
       // Peer disconnected
@@ -579,22 +680,48 @@ export default function MeetingRoom() {
   const SELF_ID = '__self';
   const selfName = user?.name || 'Bạn';
   const selfStream = screenSharing ? screenStreamRef.current : localStream;
+  const myUserId = Number(user?.userId || 0);
+
+  // Map socketId -> userId and userId -> AttendanceRecord
+  const socketToUserId = new Map<string, number>();
+  const onlineUserIds = new Set<number>();
+  participants.forEach((p) => {
+    const uid = Number(p.userId);
+    if (Number.isFinite(uid) && uid > 0) {
+      socketToUserId.set(p.socketId, uid);
+      onlineUserIds.add(uid);
+    }
+  });
+  if (myUserId > 0) onlineUserIds.add(myUserId);
+
+  const userIdToAttendanceRecord = new Map<number, AttendanceRecord>();
+  (activeAttendanceSession?.records || []).forEach((r) => {
+    userIdToAttendanceRecord.set(Number(r.studentId), r);
+  });
+  if (myOverviewRecord && myUserId > 0 && !userIdToAttendanceRecord.has(myUserId)) {
+    userIdToAttendanceRecord.set(myUserId, myOverviewRecord);
+  }
 
   interface TileInfo {
     id: string; name: string; stream: MediaStream | null; isSelf: boolean;
     showVideo: boolean; micOff: boolean; handUp: boolean; presenting: boolean;
+    attendanceRecord?: AttendanceRecord;
   }
 
-  const peerTiles: TileInfo[] = Array.from(peerStreams.entries()).map(([id, stream]) => ({
-    id,
-    name: peerNames.get(id) || `User ${id.slice(0, 6)}`,
-    stream,
-    isSelf: false,
-    showVideo: !peerCamOff.has(id) || peerSharing.has(id),
-    micOff: peerMicOff.has(id),
-    handUp: raisedHands.has(id),
-    presenting: peerSharing.has(id),
-  }));
+  const peerTiles: TileInfo[] = Array.from(peerStreams.entries()).map(([id, stream]) => {
+    const peerUid = socketToUserId.get(id);
+    return {
+      id,
+      name: peerNames.get(id) || `User ${id.slice(0, 6)}`,
+      stream,
+      isSelf: false,
+      showVideo: !peerCamOff.has(id) || peerSharing.has(id),
+      micOff: peerMicOff.has(id),
+      handUp: raisedHands.has(id),
+      presenting: peerSharing.has(id),
+      attendanceRecord: peerUid ? userIdToAttendanceRecord.get(peerUid) : undefined,
+    };
+  });
   // Người giơ tay / đang trình bày lên trước
   peerTiles.sort((a, b) => {
     const wa = (a.presenting ? 2 : 0) + (a.handUp ? 1 : 0);
@@ -604,6 +731,7 @@ export default function MeetingRoom() {
   const selfTile: TileInfo = {
     id: SELF_ID, name: `${selfName} (Bạn)`, stream: selfStream, isSelf: true,
     showVideo: camOn || screenSharing, micOff: !micOn, handUp: handRaised, presenting: screenSharing,
+    attendanceRecord: !user?.isLecturer ? userIdToAttendanceRecord.get(myUserId) : undefined,
   };
   const allTiles: TileInfo[] = [...peerTiles, selfTile];
 
@@ -651,20 +779,104 @@ export default function MeetingRoom() {
       presenting={t.presenting}
       pinned={mainId === t.id}
       onTogglePin={() => setPinnedPeer(prev => (prev === t.id ? null : t.id))}
+      attendanceRecord={t.attendanceRecord}
       style={style}
     />
   );
 
   const mainTile = mainId ? allTiles.find(t => t.id === mainId) : null;
   const sideTiles = mainId ? allTiles.filter(t => t.id !== mainId) : [];
-  const panelOpen = chatOpen || showParticipants;
+  const panelOpen = chatOpen || showParticipants || showAttendancePanel;
   const timeLabel = clock.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit' });
+
+  if (roomEndedMessage) {
+    return (
+      <div
+        className="gm-root"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          padding: 24,
+        }}
+      >
+        <div
+          style={{
+            maxWidth: 460,
+            width: '100%',
+            background: '#2C2D31',
+            border: '1px solid #3C4043',
+            borderRadius: 16,
+            padding: '28px 24px',
+            textAlign: 'center',
+            color: '#E8EAED',
+            boxShadow: '0 20px 40px rgba(0,0,0,0.45)',
+          }}
+        >
+          <div
+            style={{
+              width: 56,
+              height: 56,
+              borderRadius: '50%',
+              background: 'rgba(234, 67, 53, 0.16)',
+              color: '#F28B82',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontSize: 26,
+              margin: '0 auto 14px',
+            }}
+          >
+            ⏰
+          </div>
+          <h2 style={{ margin: '0 0 10px', fontSize: 20, fontWeight: 700 }}>
+            Buổi học đã kết thúc
+          </h2>
+          <p style={{ margin: '0 0 22px', fontSize: 14, color: '#9AA0A6', lineHeight: 1.6 }}>
+            {roomEndedMessage}
+          </p>
+          <button
+            type="button"
+            onClick={() => navigate(classId ? `/class/${classId}?tab=meetings` : '/')}
+            style={{
+              padding: '10px 22px',
+              borderRadius: 9999,
+              border: 'none',
+              background: '#8AB4F8',
+              color: '#202124',
+              fontSize: 14,
+              fontWeight: 700,
+              cursor: 'pointer',
+            }}
+          >
+            ← Quay lại lớp học
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="gm-root">
       <div className="gm-body">
         {/* ── Vùng hiển thị video ──────────────────────────── */}
         <div className="gm-stage" ref={stageRef}>
+          {!user?.isLecturer && (
+            <StudentAttendanceFloatingCard
+              activeSession={activeAttendanceSession}
+              myRecordFromOverview={myOverviewRecord}
+              myUserId={myUserId}
+              camOn={camOn}
+              localStream={localStream}
+              onRequestTurnOnCam={async () => {
+                if (!camOnRef.current) {
+                  await toggleCam();
+                }
+              }}
+              reminderPulse={reminderPulse}
+            />
+          )}
+
           {presenter && (
             <div className="gm-present-chip">
               {presenter.isSelf ? 'Bạn đang trình bày' : `${presenter.name} đang trình bày`}
@@ -691,15 +903,41 @@ export default function MeetingRoom() {
           )}
         </div>
 
-        {/* ── Panel bên phải (Chat / Người tham gia) ───────── */}
+        {/* ── Panel bên phải (Chat / Người tham gia / Điểm danh) ───────── */}
         {panelOpen && (
-          <aside className="gm-panel">
+          <aside className="gm-panel" style={{ width: showAttendancePanel ? 410 : 360 }}>
             <div className="gm-panel-header">
-              <h3>{chatOpen ? 'Tin nhắn trong cuộc họp' : 'Mọi người'}</h3>
-              <button type="button" className="gm-icon-btn-plain" onClick={() => { setChatOpen(false); setShowParticipants(false); }} aria-label="Đóng">
+              <h3>
+                {showAttendancePanel
+                  ? 'Điểm danh khuôn mặt'
+                  : chatOpen
+                  ? 'Tin nhắn trong cuộc họp'
+                  : 'Mọi người'}
+              </h3>
+              <button
+                type="button"
+                className="gm-icon-btn-plain"
+                onClick={() => {
+                  setChatOpen(false);
+                  setShowParticipants(false);
+                  setShowAttendancePanel(false);
+                }}
+                aria-label="Đóng"
+              >
                 <FiX size={20} />
               </button>
             </div>
+
+            {showAttendancePanel && user?.isLecturer && (
+              <LecturerAttendanceSidePanel
+                classId={classId || '0'}
+                meetingCode={meetingCode || ''}
+                activeSession={activeAttendanceSession}
+                classProfileSummary={classProfileSummary}
+                onlineUserIds={onlineUserIds}
+                onRefreshOverview={refreshAttendanceOverview}
+              />
+            )}
 
             {chatOpen && (
               <>
@@ -779,13 +1017,35 @@ export default function MeetingRoom() {
         </div>
 
         <div className="gm-bar-right">
+          {user?.isLecturer && (
+            <button
+              type="button"
+              className={`gm-btn-side ${showAttendancePanel ? 'is-active' : ''}`}
+              onClick={() => {
+                setShowAttendancePanel(!showAttendancePanel);
+                setShowParticipants(false);
+                setChatOpen(false);
+              }}
+              title="Điểm danh khuôn mặt tự động"
+            >
+              <FiUserCheck size={20} />
+              {activeAttendanceSession?.roundOpen && (
+                <span
+                  className="gm-badge"
+                  style={{ right: 2, top: 4, background: '#10B981', color: '#fff' }}
+                >
+                  ●
+                </span>
+              )}
+            </button>
+          )}
           <button type="button" className={`gm-btn-side ${showParticipants ? 'is-active' : ''}`}
-            onClick={() => { setShowParticipants(!showParticipants); setChatOpen(false); }} title="Mọi người">
+            onClick={() => { setShowParticipants(!showParticipants); setChatOpen(false); setShowAttendancePanel(false); }} title="Mọi người">
             <FiUsers size={20} />
             <span className="gm-badge gm-badge-count">{totalPeople}</span>
           </button>
           <button type="button" className={`gm-btn-side ${chatOpen ? 'is-active' : ''}`}
-            onClick={() => { setChatOpen(!chatOpen); setShowParticipants(false); }} title="Trò chuyện với mọi người">
+            onClick={() => { setChatOpen(!chatOpen); setShowParticipants(false); setShowAttendancePanel(false); }} title="Trò chuyện với mọi người">
             <FiMessageSquare size={20} />
             {unreadChat > 0 && !chatOpen && <span className="gm-badge gm-badge-unread">{unreadChat}</span>}
           </button>
@@ -817,7 +1077,7 @@ function initialOf(name: string) {
 }
 
 // ── Video Tile (dùng cho cả mình và người khác) ──────────────
-function VideoTile({ name, stream, isSelf, showVideo, micOff, handUp, presenting, pinned, onTogglePin, style }: {
+function VideoTile({ name, stream, isSelf, showVideo, micOff, handUp, presenting, pinned, onTogglePin, attendanceRecord, style }: {
   name: string;
   stream: MediaStream | null;
   isSelf: boolean;
@@ -827,6 +1087,7 @@ function VideoTile({ name, stream, isSelf, showVideo, micOff, handUp, presenting
   presenting: boolean;
   pinned: boolean;
   onTogglePin: () => void;
+  attendanceRecord?: AttendanceRecord;
   style?: CSSProperties;
 }) {
   const ref = useRef<HTMLVideoElement>(null);
@@ -839,6 +1100,49 @@ function VideoTile({ name, stream, isSelf, showVideo, micOff, handUp, presenting
 
   const palette = colorFor(name);
   const mirrored = isSelf && !presenting;
+
+  const renderAttendanceChip = () => {
+    if (!attendanceRecord) return null;
+    const st = attendanceRecord.status;
+    const bg =
+      st === 'present' || st === 'manual'
+        ? 'rgba(5, 150, 105, 0.88)'
+        : st === 'mismatch'
+        ? 'rgba(220, 38, 38, 0.88)'
+        : st === 'no_profile'
+        ? 'rgba(217, 119, 6, 0.88)'
+        : 'rgba(71, 85, 105, 0.82)';
+    const label =
+      st === 'present'
+        ? '✓ Có mặt'
+        : st === 'manual'
+        ? '✓ Có mặt (GV)'
+        : st === 'mismatch'
+        ? '⚠ Không khớp'
+        : st === 'no_profile'
+        ? '🪪 Chưa ĐK'
+        : '⏳ Chưa ĐD';
+
+    return (
+      <div
+        style={{
+          position: 'absolute',
+          bottom: 8,
+          right: 8,
+          zIndex: 2,
+          background: bg,
+          color: '#fff',
+          fontSize: 11,
+          fontWeight: 600,
+          padding: '2px 8px',
+          borderRadius: 999,
+          boxShadow: '0 2px 6px rgba(0,0,0,0.35)',
+        }}
+      >
+        {label}
+      </div>
+    );
+  };
 
   return (
     <div
@@ -864,6 +1168,7 @@ function VideoTile({ name, stream, isSelf, showVideo, micOff, handUp, presenting
 
       {handUp && <div className="gm-hand-chip"><MdPanTool size={16} /></div>}
       {micOff && <div className="gm-mic-chip"><FiMicOff size={14} /></div>}
+      {renderAttendanceChip()}
 
       <button type="button" className="gm-pin-btn" onClick={(e) => { e.stopPropagation(); onTogglePin(); }}
         title={pinned ? 'Bỏ ghim' : 'Ghim'}>

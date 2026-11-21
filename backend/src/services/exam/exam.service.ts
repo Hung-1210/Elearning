@@ -3,6 +3,7 @@ import type { PoolClient } from 'pg';
 import { pool, query, queryOne, withTransaction } from '../../config/database.js';
 import { HttpError } from '../../utils/http-error.js';
 import { DEFAULT_SETTINGS, GAZE_PRESETS, resolveProctoringSettings, type ProctoringSettings } from '../proctoring/policy.js';
+import { ensureFaceAttendanceTables } from '../face-profile.service.js';
 
 // ===========================================================================
 // NGÂN HÀNG CÂU HỎI
@@ -168,8 +169,8 @@ export async function importBankQuestions(
     for (const item of normalizedList) {
       const q = await client.query(
         `INSERT INTO bank_questions
-           (class_id, created_by, question_type, content, explanation, default_points, difficulty, chapter, tags)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+           (class_id, created_by, question_type, content, explanation, default_points, difficulty, chapter, tags, source)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'import')
          RETURNING id`,
         [
           classId,
@@ -278,15 +279,22 @@ export async function getBankQuestion(id: number, dbClient?: PoolClient) {
   return { ...question, options };
 }
 
-export async function listBankQuestions(classId: number, filters: { chapter?: string; difficulty?: string; questionType?: string }) {
+export async function listBankQuestions(
+  classId: number,
+  filters: { chapter?: string; difficulty?: string; questionType?: string; source?: string },
+) {
   const conditions = ['bq.class_id = $1'];
   const params: any[] = [classId];
   if (filters.chapter) { params.push(filters.chapter); conditions.push(`bq.chapter = $${params.length}`); }
   if (filters.difficulty) { params.push(filters.difficulty); conditions.push(`bq.difficulty = $${params.length}`); }
   if (filters.questionType) { params.push(filters.questionType); conditions.push(`bq.question_type = $${params.length}`); }
+  if (filters.source) { params.push(filters.source); conditions.push(`COALESCE(bq.source, 'manual') = $${params.length}`); }
   const questions = await query(
     `SELECT bq.id, bq.question_type, bq.content, bq.explanation, bq.default_points,
             bq.difficulty, bq.chapter, bq.tags, bq.created_at, bq.updated_at,
+            COALESCE(bq.source, 'manual') AS source,
+            bq.ai_draft_id,
+            COALESCE(bq.source_doc_ids, '{}'::int[]) AS source_doc_ids,
             u.name AS creator_name,
             (SELECT COUNT(DISTINCT eq.exam_id) FROM exam_questions eq WHERE eq.source_bank_question_id = bq.id)::int AS used_in_exams_count
        FROM bank_questions bq
@@ -443,6 +451,7 @@ function computeDisplayStatus(row: { status: string; start_time: Date; end_time:
 }
 
 export async function listExamsForClass(classId: number) {
+  await ensureFaceAttendanceTables();
   const rows = await query<any>(
     `SELECT e.*, c.name AS class_name,
             (SELECT COUNT(*) FROM exam_attempts a WHERE a.exam_id = e.id AND a.status='submitted')::int AS submitted_count,
@@ -451,7 +460,20 @@ export async function listExamsForClass(classId: number) {
             (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id)::int AS total_questions,
             (SELECT COALESCE(SUM(eq.points), 0) FROM exam_questions eq WHERE eq.exam_id = e.id)::numeric AS total_points,
             (SELECT COUNT(*) FROM proctoring_events pe JOIN exam_attempts a ON a.id = pe.attempt_id WHERE a.exam_id = e.id AND pe.is_confirmed = TRUE)::int AS violation_count,
-            eps.enabled AS proctoring_enabled
+            (SELECT COUNT(*)
+               FROM classes_n_students cs
+               LEFT JOIN user_face_profiles ufp ON ufp.user_id = cs.student_id
+              WHERE cs.class_id = e.class_id
+                AND (ufp.user_id IS NULL OR (ufp.review_status = 'rejected' AND ufp.approved_embedding IS NULL))
+            )::int AS unregistered_face_count,
+            (SELECT COUNT(*)
+               FROM classes_n_students cs
+               JOIN user_face_profiles ufp ON ufp.user_id = cs.student_id
+              WHERE cs.class_id = e.class_id
+                AND ufp.review_status = 'pending'
+            )::int AS pending_face_count,
+            eps.enabled AS proctoring_enabled,
+            COALESCE(eps.require_face_profile, TRUE) AS require_face_profile
        FROM exams e
        JOIN classes c ON c.id = e.class_id
        LEFT JOIN exam_proctoring_settings eps ON eps.exam_id = e.id
@@ -462,6 +484,7 @@ export async function listExamsForClass(classId: number) {
 }
 
 export async function getExamForTeacher(examId: number) {
+  await ensureFaceAttendanceTables();
   const exam = await queryOne<any>('SELECT * FROM exams WHERE id = $1', [examId]);
   if (!exam) throw new HttpError(404, 'Không tìm thấy đề thi');
   const settingsRow = await queryOne('SELECT * FROM exam_proctoring_settings WHERE exam_id = $1', [examId]);
@@ -485,13 +508,15 @@ export async function getExamForTeacher(examId: number) {
 }
 
 export async function getExamForStudent(examId: number) {
+  await ensureFaceAttendanceTables();
   const exam = await queryOne<any>(
     `SELECT e.*, c.name AS class_name,
             (SELECT COUNT(*) FROM exam_questions eq WHERE eq.exam_id = e.id)::int AS total_questions,
             (SELECT COALESCE(SUM(eq.points), 0) FROM exam_questions eq WHERE eq.exam_id = e.id)::numeric AS total_points,
             eps.enabled AS proctoring_enabled,
             eps.verify_identity AS verify_identity,
-            eps.detect_identity_swap AS detect_identity_swap
+            eps.detect_identity_swap AS detect_identity_swap,
+            COALESCE(eps.require_face_profile, TRUE) AS require_face_profile
        FROM exams e
        JOIN classes c ON c.id = e.class_id
        LEFT JOIN exam_proctoring_settings eps ON eps.exam_id = e.id
@@ -604,6 +629,7 @@ async function guardNotPublishedWithAttempts(examId: number) {
 // CẤU HÌNH GIÁM SÁT AI
 // ===========================================================================
 export async function updateProctoringSettings(examId: number, input: Partial<ProctoringSettings>) {
+  await ensureFaceAttendanceTables();
   const resolved = resolveProctoringSettings(input);
   await query(
     `UPDATE exam_proctoring_settings SET
@@ -614,7 +640,7 @@ export async function updateProctoringSettings(examId: number, input: Partial<Pr
        gaze_pitch_threshold_deg=$18, gaze_min_duration_ms=$19, detect_phone=$20, detect_document=$21,
        detect_secondary_screen=$22, detect_headphone=$23, detect_extra_person=$24, object_conf_threshold=$25,
        detect_tab_switch=$26, violation_action=$27, auto_submit_after_violations=$28,
-       frame_interval_ms=$29, evidence_retention_days=$30, updated_at=NOW()
+       frame_interval_ms=$29, evidence_retention_days=$30, require_face_profile=$31, updated_at=NOW()
      WHERE exam_id=$1`,
     [examId, resolved.enabled, resolved.verifyIdentity, resolved.detectIdentitySwap,
      resolved.identityRecheckIntervalSec, resolved.identityThreshold, resolved.detectNoFace,
@@ -624,7 +650,7 @@ export async function updateProctoringSettings(examId: number, input: Partial<Pr
      resolved.gazeMinDurationMs, resolved.detectPhone, resolved.detectDocument, resolved.detectSecondaryScreen,
      resolved.detectHeadphone, resolved.detectExtraPerson, resolved.objectConfThreshold, resolved.detectTabSwitch,
      resolved.violationAction, resolved.autoSubmitAfterViolations, resolved.frameIntervalMs,
-     resolved.evidenceRetentionDays],
+     resolved.evidenceRetentionDays, resolved.requireFaceProfile ?? true],
   );
   return resolved;
 }
@@ -643,6 +669,7 @@ export function mapSettingsRow(row: any): ProctoringSettings {
 
   return {
     enabled: row.enabled, verifyIdentity: row.verify_identity, detectIdentitySwap: row.detect_identity_swap,
+    requireFaceProfile: row.require_face_profile !== false,
     identityRecheckIntervalSec: row.identity_recheck_interval_sec, identityThreshold: Number(row.identity_threshold),
     detectNoFace: row.detect_no_face, noFaceGraceSec: row.no_face_grace_sec, detectMultipleFaces: row.detect_multiple_faces,
     trackHeadPose: row.track_head_pose, headSensitivity: row.head_sensitivity, headYawThresholdDeg: row.head_yaw_threshold_deg,

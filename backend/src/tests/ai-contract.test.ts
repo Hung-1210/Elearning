@@ -114,6 +114,15 @@ let visibility: typeof import('../services/exam/visibility.js');
 let examService: typeof import('../services/exam/exam.service.js');
 let exportService: typeof import('../services/exam/export.service.js');
 let storageService: typeof import('../services/proctoring/storage.js');
+let faceProfileService: typeof import('../services/face-profile.service.js');
+let attendanceService: typeof import('../services/attendance.service.js');
+let aiChunker: typeof import('../services/ai/chunker.js');
+let aiTextExtract: typeof import('../services/ai/text-extract.js');
+let aiSchema: typeof import('../services/ai/schema.js');
+let aiVectorStore: typeof import('../services/ai/vector-store.js');
+let aiQuestionGen: typeof import('../services/ai/question-gen.service.js');
+let aiRagService: typeof import('../services/ai/rag.service.js');
+let aiGeminiClient: typeof import('../services/ai/gemini.client.js');
 let db: typeof import('../config/database.js');
 let settings: ReturnType<typeof import('../services/proctoring/policy.js').resolveProctoringSettings>;
 const run = { face: true, headPose: true, gaze: false, objects: true, identity: true };
@@ -131,6 +140,15 @@ before(async () => {
   examService = await import('../services/exam/exam.service.js');
   exportService = await import('../services/exam/export.service.js');
   storageService = await import('../services/proctoring/storage.js');
+  faceProfileService = await import('../services/face-profile.service.js');
+  attendanceService = await import('../services/attendance.service.js');
+  aiChunker = await import('../services/ai/chunker.js');
+  aiTextExtract = await import('../services/ai/text-extract.js');
+  aiSchema = await import('../services/ai/schema.js');
+  aiVectorStore = await import('../services/ai/vector-store.js');
+  aiQuestionGen = await import('../services/ai/question-gen.service.js');
+  aiRagService = await import('../services/ai/rag.service.js');
+  aiGeminiClient = await import('../services/ai/gemini.client.js');
   db = await import('../config/database.js');
   client.setFetchImplForTest(mockFetch);
   settings = policy.resolveProctoringSettings({
@@ -640,4 +658,315 @@ test('Answer File Storage: lọc đuôi file, làm sạch tên file, lưu/đọc
 
   // 4. Sau khi xóa thì đọc lại phải báo lỗi
   await assert.rejects(() => storageService.readAttemptAnswerFile(saved.relPath));
+});
+
+test('Face Profile & Attendance: chuẩn hóa L2 trung bình 4 ảnh, kiểm tra đồng nhất khuôn mặt và lưu/xóa ảnh riêng tư', async () => {
+  // 1. Tạo 4 vector 512 chiều cùng hướng (cùng 1 người ở 4 góc chụp nhẹ)
+  const base = new Array(512).fill(0).map((_, i) => (i % 2 === 0 ? 1 : 0.5));
+  const e1 = base.map((v, i) => v + (i === 0 ? 0.05 : 0));
+  const e2 = base.map((v, i) => v + (i === 1 ? 0.04 : 0));
+  const e3 = base.map((v, i) => v + (i === 2 ? -0.04 : 0));
+  const e4 = base.map((v, i) => v + (i === 3 ? 0.03 : 0));
+
+  const consistencyOk = faceProfileService.checkIntraProfileConsistency([e1, e2, e3, e4]);
+  assert.equal(consistencyOk.ok, true);
+  assert.ok(consistencyOk.minSim > 0.95);
+
+  const meanEmb = faceProfileService.computeNormalizedMeanEmbedding([e1, e2, e3, e4]);
+  assert.equal(meanEmb.length, 512);
+  // Độ dài L2 của vector trung bình sau chuẩn hóa phải xấp xỉ 1.0
+  const normSq = meanEmb.reduce((s, v) => s + v * v, 0);
+  assert.ok(Math.abs(Math.sqrt(normSq) - 1) < 1e-3);
+
+  // 2. Nếu có 1 ảnh người khác hoàn toàn (trực giao / ngược hướng) => checkIntraProfileConsistency phát hiện ngay
+  const impostor = new Array(512).fill(0).map((_, i) => (i % 2 === 0 ? -1 : -0.5));
+  const consistencyBad = faceProfileService.checkIntraProfileConsistency([e1, e2, impostor, e4]);
+  assert.equal(consistencyBad.ok, false);
+  assert.deepEqual(consistencyBad.badPair, [1, 3]);
+
+  // 3. Lưu và xóa thư mục 4 ảnh hồ sơ khuôn mặt trong private-uploads/face-profiles/<userId>
+  const dummyJpg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+  const p1 = await storageService.saveFaceProfilePhoto(888888, 1, dummyJpg);
+  assert.ok(p1.startsWith('face-profiles/888888/step-1-'));
+  const readBack = await storageService.readEvidenceImage(p1);
+  assert.equal(readBack.length, dummyJpg.length);
+  await storageService.deleteUserFaceProfileDir(888888);
+  await assert.rejects(() => storageService.readEvidenceImage(p1));
+
+  // 4. Quy tắc trạng thái hiệu lực điểm danh (chỉnh tay Có mặt / Có phép / Vắng)
+  assert.equal(
+    attendanceService.computeEffectiveStatus({ status: 'manual', sub_status: 'manual_present' }),
+    'present',
+  );
+  assert.equal(
+    attendanceService.computeEffectiveStatus({ status: 'manual', sub_status: 'excused' }),
+    'present',
+  );
+  assert.equal(
+    attendanceService.computeEffectiveStatus({ status: 'manual', sub_status: 'manual_absent' }),
+    'absent',
+  );
+  assert.equal(attendanceService.STRICTNESS_THRESHOLDS.balanced, 0.45);
+});
+
+test('AI Text Extract & Chunker: nhận diện tiêu đề chương, chia chunk có overlap và phát hiện PDF scan / định dạng không hỗ trợ', async () => {
+  assert.equal(aiChunker.detectHeadingLine('Chương 1: Tổng quan về Cơ sở dữ liệu'), 'Chương 1: Tổng quan về Cơ sở dữ liệu');
+  assert.equal(aiChunker.detectHeadingLine('1.2. Mô hình thực thể kết hợp'), '1.2. Mô hình thực thể kết hợp');
+  assert.equal(aiChunker.detectHeadingLine('Đây là một câu văn bình thường kết thúc bằng dấu chấm.'), null);
+
+  const samplePages = [
+    {
+      page: 1,
+      text: 'Chương 1: Lập trình Socket\n\nSocket là giao diện lập trình ứng dụng mạng cho phép các tiến trình giao tiếp qua TCP hoặc UDP.\n\n' +
+        'Giao thức TCP hướng kết nối, đảm bảo truyền tin cậy và đúng thứ tự gói tin. '.repeat(25),
+    },
+    {
+      page: 2,
+      text: 'Chương 2: Giao thức UDP\n\nUDP là giao thức phi kết nối, tốc độ nhanh và độ trễ thấp, phù hợp truyền đa phương tiện.',
+    },
+  ];
+
+  const chunks = aiChunker.chunkDocumentPages(samplePages, '2/1788439832925-Bài giảng mạng.pdf', {
+    targetTokens: 200,
+    overlapTokens: 40,
+  });
+  assert.ok(chunks.length >= 2, 'Phải tách thành nhiều chunk khi vượt targetTokens');
+  assert.equal(chunks[0].heading, 'Chương 1: Lập trình Socket');
+  assert.ok(chunks[0].embedInput.includes('[Bài giảng mạng.pdf – Mục: Chương 1: Lập trình Socket'));
+  assert.ok(chunks.some((c) => c.heading === 'Chương 2: Giao thức UDP'));
+
+  // Kiểm tra định dạng không hỗ trợ
+  const unsup = await aiTextExtract.extractDocumentPages(Buffer.from('fake'), 'archive.zip');
+  assert.equal(unsup.status, 'unsupported');
+
+  // Kiểm tra phát hiện PDF ảnh scan (không có lớp chữ)
+  const emptyPdf = Buffer.from('%PDF-1.4\n1 0 obj << /Type /Page >> endobj\n%%EOF', 'latin1');
+  const scanned = await aiTextExtract.extractDocumentPages(emptyPdf, 'scan.pdf');
+  assert.equal(scanned.status, 'scanned_pdf');
+  assert.equal(scanned.errorCode, 'scanned_pdf');
+});
+
+test('AI VectorStore & pgvector: chuẩn hóa L2 vector 768 chiều, kết hợp Hybrid RRF và trích dẫn RAG', () => {
+  const rawVec = [3, 4, ...new Array(766).fill(0)];
+  const lit = aiSchema.toPgVectorLiteral(rawVec, 768);
+  assert.ok(lit.startsWith('[0.6,0.8,0,'));
+  const parsed = aiSchema.parsePgVectorLiteral(lit);
+  assert.ok(parsed);
+  assert.equal(parsed.length, 768);
+  assert.ok(Math.abs(aiSchema.cosineSim(parsed, parsed) - 1) < 1e-4);
+
+  const vecHits = [
+    {
+      chunkId: 10,
+      docId: 1,
+      fileName: '2/1700000000000-Giao_trinh.pdf',
+      chunkIndex: 0,
+      heading: 'Chương 1',
+      pageFrom: 5,
+      pageTo: 6,
+      content: 'Khóa chính xác định duy nhất một bản ghi.',
+      tokenCount: 50,
+      vectorSim: 0.82,
+    },
+    {
+      chunkId: 11,
+      docId: 1,
+      fileName: '2/1700000000000-Giao_trinh.pdf',
+      chunkIndex: 1,
+      heading: 'Chương 1',
+      pageFrom: 7,
+      pageTo: 7,
+      content: 'Khóa ngoại tham chiếu tới khóa chính của bảng khác.',
+      tokenCount: 50,
+      vectorSim: 0.78,
+    },
+  ];
+  const ftsHits = [
+    {
+      chunkId: 11,
+      docId: 1,
+      fileName: '2/1700000000000-Giao_trinh.pdf',
+      chunkIndex: 1,
+      heading: 'Chương 1',
+      pageFrom: 7,
+      pageTo: 7,
+      content: 'Khóa ngoại tham chiếu tới khóa chính của bảng khác.',
+      tokenCount: 50,
+      ftsScore: 0.9,
+    },
+    {
+      chunkId: 20,
+      docId: 2,
+      fileName: '2/1700000000000-Slide_CSDL.pptx',
+      chunkIndex: 0,
+      heading: 'Slide 3',
+      pageFrom: 3,
+      pageTo: 3,
+      content: 'Ví dụ ràng buộc toàn vẹn tham chiếu.',
+      tokenCount: 40,
+      ftsScore: 0.5,
+    },
+  ];
+
+  const merged = aiVectorStore.mergeHybridResultsRRF(vecHits, ftsHits, 3);
+  assert.equal(merged.length, 3);
+  // Chunk #11 xuất hiện ở cả Vector lẫn FTS nên phải đứng đầu bảng xếp hạng RRF
+  assert.equal(merged[0].chunkId, 11);
+  assert.equal(merged[0].displayFileName, 'Giao_trinh.pdf');
+
+  const citations = aiRagService.buildCitationsFromRetrievedChunks(
+    'Khóa ngoại dùng để tham chiếu tới khóa chính [1] và đảm bảo toàn vẹn tham chiếu [3].',
+    merged,
+  );
+  assert.deepEqual(citations.map((c) => c.n), [1, 3]);
+});
+
+test('AI Question Generation & Gemini Client: chuẩn hóa ma trận 3x3, kiểm tra căn cứ trích dẫn, parse JSON và stream SSE', async () => {
+  // 1. Ma trận 3x3 (Một đáp án + Nhiều đáp án + Tự luận)
+  const cfg = aiQuestionGen.normalizeJobConfig({
+    matrix: {
+      single_choice: { easy: 2, medium: 2, hard: 1 },
+      multiple_choice: { easy: 1, medium: 0, hard: 1 },
+      essay: { easy: 0, medium: 1, hard: 0 },
+    },
+    optionCount: 4,
+    chapter: 'Chương 2',
+    verify: false,
+  });
+  assert.equal(cfg.totalRequested, 8);
+  assert.equal(cfg.verify, false);
+
+  // Vượt 50 câu phải ném lỗi 400
+  assert.throws(
+    () =>
+      aiQuestionGen.normalizeJobConfig({
+        matrix: {
+          single_choice: { easy: 30, medium: 25, hard: 0 },
+          multiple_choice: { easy: 0, medium: 0, hard: 0 },
+          essay: { easy: 0, medium: 0, hard: 0 },
+        },
+      }),
+    /tối đa là 50 câu/,
+  );
+
+  // 2. Validate bản nháp trắc nghiệm và tự luận + kiểm tra căn cứ trích dẫn (grounding)
+  const chunksMap = new Map([
+    [
+      101,
+      {
+        chunkId: 101,
+        docId: 5,
+        fileName: '2/1700000000000-Mang_may_tinh.pdf',
+        displayFileName: 'Mang_may_tinh.pdf',
+        heading: 'Chương 3: Giao thức tầng giao vận',
+        pageFrom: 12,
+        pageTo: 13,
+        content:
+          'Giao thức TCP thực hiện bắt tay ba bước (three-way handshake) gồm SYN, SYN-ACK và ACK trước khi truyền dữ liệu.',
+      },
+    ],
+  ]);
+  const fallbackChunks = Array.from(chunksMap.values());
+
+  const mcqDraft = aiQuestionGen.validateAndNormalizeAiDraft(
+    {
+      questionType: 'single_choice',
+      difficulty: 'easy',
+      content: 'Giao thức TCP sử dụng cơ chế nào để thiết lập kết nối?',
+      options: [
+        { content: 'Bắt tay ba bước (SYN, SYN-ACK, ACK)', isCorrect: true },
+        { content: 'Truyền quảng bá trực tiếp không kết nối', isCorrect: false },
+        { content: 'Định tuyến động theo trạng thái liên kết', isCorrect: false },
+        { content: 'Phân giải tên miền đệ quy', isCorrect: false },
+      ],
+      explanation: 'TCP dùng cơ chế three-way handshake gồm SYN, SYN-ACK và ACK.',
+      sourceChunkIds: [101],
+      sourceQuote: 'Giao thức TCP thực hiện bắt tay ba bước (three-way handshake) gồm SYN, SYN-ACK và ACK',
+    },
+    'single_choice',
+    chunksMap,
+    fallbackChunks,
+    cfg,
+  );
+  assert.equal(mcqDraft.qualityFlags.length, 0, 'Trích dẫn khớp tài liệu thì không bị gắn cờ ungrounded');
+  assert.equal(mcqDraft.options.filter((o) => o.isCorrect).length, 1);
+
+  const essayDraft = aiQuestionGen.validateAndNormalizeAiDraft(
+    {
+      questionType: 'essay',
+      difficulty: 'medium',
+      content: 'Hãy phân tích quá trình bắt tay ba bước của giao thức TCP.',
+      options: [],
+      explanation: 'Đáp án mẫu: Nêu đủ 3 bước SYN (0.5đ), SYN-ACK (0.5đ), ACK (0.5đ).',
+      sourceChunkIds: [101],
+      sourceQuote: 'Trích dẫn hoàn toàn không có trong đoạn văn bản gốc của giáo trình',
+    },
+    'essay',
+    chunksMap,
+    fallbackChunks,
+    cfg,
+  );
+  assert.equal(essayDraft.questionType, 'essay');
+  assert.ok(essayDraft.qualityFlags.includes('ungrounded'), 'Trích dẫn sai lệch phải bị gắn cờ ungrounded');
+
+  // 3. Kiểm tra safeParseJson chịu được khối markdown ```json ... ```
+  const parsedJson = aiGeminiClient.safeParseJson<{ questions: number[] }>(
+    '```json\n{"questions": [1, 2, 3]}\n```',
+  );
+  assert.deepEqual(parsedJson.questions, [1, 2, 3]);
+
+  // 4. Kiểm tra Gemini Client embedBatch (768 chiều chuẩn hóa L2) & streamGenerateText (SSE)
+  const prevKey = process.env.GEMINI_API_KEY;
+  process.env.GEMINI_API_KEY = 'test-gemini-key';
+  aiGeminiClient.setGeminiFetchForTest(async (input) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+    if (url.includes(':batchEmbedContents')) {
+      return jsonResponse(200, {
+        embeddings: [
+          { values: [3, 4, ...new Array(766).fill(0)] },
+        ],
+      });
+    }
+    if (url.includes(':streamGenerateContent')) {
+      const ssePayload =
+        'data: ' +
+        JSON.stringify({
+          candidates: [{ content: { parts: [{ text: 'Khóa ngoại ' }] } }],
+        }) +
+        '\n\n' +
+        'data: ' +
+        JSON.stringify({
+          candidates: [{ content: { parts: [{ text: 'tham chiếu tới khóa chính [1].' }] } }],
+          usageMetadata: { promptTokenCount: 120, candidatesTokenCount: 18 },
+        }) +
+        '\n\n';
+      return new Response(ssePayload, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    }
+    return jsonResponse(200, {});
+  });
+
+  try {
+    const embRes = await aiGeminiClient.embedBatch(['Khóa ngoại là gì?']);
+    assert.equal(embRes.embeddings.length, 1);
+    assert.equal(embRes.embeddings[0].length, 768);
+    assert.equal(embRes.embeddings[0][0], 0.6);
+    assert.equal(embRes.embeddings[0][1], 0.8);
+
+    const deltas: string[] = [];
+    const streamRes = await aiGeminiClient.streamGenerateText({
+      contents: [{ role: 'user', parts: [{ text: 'Hỏi' }] }],
+      onDelta: (d) => deltas.push(d),
+    });
+    assert.equal(streamRes.fullText, 'Khóa ngoại tham chiếu tới khóa chính [1].');
+    assert.equal(deltas.length, 2);
+    assert.equal(streamRes.tokensIn, 120);
+    assert.equal(streamRes.tokensOut, 18);
+  } finally {
+    aiGeminiClient.setGeminiFetchForTest(null);
+    if (prevKey === undefined) delete process.env.GEMINI_API_KEY;
+    else process.env.GEMINI_API_KEY = prevKey;
+  }
 });

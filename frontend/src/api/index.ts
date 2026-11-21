@@ -9,6 +9,11 @@ export const authApi = {
     api.post('/auth/signup', { name, loginId, password }),
   logout: () => api.post('/auth/logout'),
   getMe: () => api.get<{ success: boolean; data: { user: AuthPayload } }>('/auth/me'),
+  changePassword: (currentPassword: string, newPassword: string) =>
+    api.put<{ success: boolean; message: string }>('/auth/change-password', {
+      currentPassword,
+      newPassword,
+    }),
 };
 
 // ── Classes ───────────────────────────────────────────────────
@@ -176,6 +181,7 @@ export const examApi = {
       {
         enabled: settings.enabled,
         verifyIdentity: settings.verify_identity ?? settings.face_recognition_enabled ?? settings.verifyIdentity,
+        requireFaceProfile: settings.require_face_profile ?? settings.requireFaceProfile,
         detectIdentitySwap: settings.detect_identity_swap ?? settings.detectIdentitySwap,
         identityRecheckIntervalSec: settings.identity_recheck_interval_sec ?? settings.identityRecheckIntervalSec,
         identityThreshold: settings.identity_threshold ?? settings.identityThreshold,
@@ -285,8 +291,13 @@ export const studentExamApi = {
     api.get<{
       success: boolean;
       data: {
-        exam: import('../types').Exam & { verify_identity?: boolean; detect_identity_swap?: boolean };
+        exam: import('../types').Exam & {
+          verify_identity?: boolean;
+          require_face_profile?: boolean;
+          detect_identity_swap?: boolean;
+        };
         student: { name: string; login_id: string };
+        faceProfile?: import('../types').FaceProfileMe;
       };
     }>(`/exams/${examId}/student`),
   listExams: (classId: number | string) =>
@@ -296,7 +307,15 @@ export const studentExamApi = {
   precheck: (examId: number | string, imageBlob: Blob) => {
     const formData = new FormData();
     formData.append('image', imageBlob, 'precheck.jpg');
-    return api.post<{ success: boolean; data: { precheckId: string; expiresAt: string } }>(`/exams/${examId}/precheck`, formData);
+    return api.post<{
+      success: boolean;
+      data: {
+        precheckId: string;
+        expiresAt: string;
+        faceProfileMatched?: boolean;
+        faceProfileSimilarity?: number | null;
+      };
+    }>(`/exams/${examId}/precheck`, formData);
   },
   startAttempt: (examId: number | string, precheckId?: string) =>
     api.post<{ success: boolean; data: import('../types').ExamAttempt & { attempt?: import('../types').ExamAttempt } }>(`/exams/${examId}/attempts`, { precheckId }),
@@ -350,3 +369,162 @@ export const studentExamApi = {
   sendTelemetryFrame: (attemptId: number | string, formData: FormData) =>
     api.post<{ success: boolean; data: any }>(`/attempts/${attemptId}/frames`, formData),
 };
+
+// ── Face Profile (Khuôn mặt của tôi & Giảng viên duyệt) ────────
+export const faceProfileApi = {
+  getMe: () =>
+    api.get<{ success: boolean; data: import('../types').FaceProfileMe }>('/face-profile/me'),
+  validateStep: (imageBlob: Blob, stepNo: number) => {
+    const formData = new FormData();
+    formData.append('photo', imageBlob, `step_${stepNo}.jpg`);
+    formData.append('stepNo', String(stepNo));
+    return api.post<{
+      success: boolean;
+      data: { valid: boolean; stepNo: number; faceScore: number | null; modelVersion: string };
+    }>('/face-profile/validate-step', formData);
+  },
+  enroll: (photoBlobs: Blob[], consented = true) => {
+    const formData = new FormData();
+    photoBlobs.forEach((blob, idx) => {
+      formData.append('photos', blob, `photo_${idx + 1}.jpg`);
+    });
+    formData.append('consented', String(consented));
+    return api.post<{
+      success: boolean;
+      data: import('../types').FaceProfileMe;
+    }>('/face-profile/enroll', formData);
+  },
+  deleteMe: () =>
+    api.delete<{ success: boolean; data: { deleted: boolean } }>('/face-profile/me'),
+  fetchMyPhotoBlob: (step: number) =>
+    api.get<Blob>(`/face-profile/me/photos/${step}`, { responseType: 'blob' }),
+
+  // Lecturer review
+  listForClass: (classId: number | string, params?: { status?: string; search?: string }) =>
+    api.get<{
+      success: boolean;
+      data: {
+        items: import('../types').ClassFaceProfileItem[];
+        summary: import('../types').ClassFaceProfileSummary;
+      };
+    }>(`/classes/${classId}/face-profiles`, { params }),
+  fetchStudentPhotoBlob: (studentId: number | string, step: number) =>
+    api.get<Blob>(`/face-profiles/${studentId}/photos/${step}`, {
+      responseType: 'blob',
+    }),
+  review: (
+    studentId: number | string,
+    action: 'approve' | 'reject',
+    reason?: string,
+  ) =>
+    api.put<{ success: boolean; data: any }>(
+      `/face-profiles/${studentId}/review`,
+      { action, reason },
+    ),
+  reviewBulk: (userIds: number[], action: 'approve' | 'reject' = 'approve', reason?: string) =>
+    api.put<{ success: boolean; data: { updatedCount: number } }>(
+      `/face-profiles/review-bulk`,
+      { userIds, action, reason },
+    ),
+};
+
+// ── Meeting Face Attendance (Điểm danh khuôn mặt trong phòng học) ──
+export const attendanceApi = {
+  getOverview: (meetingIdOrCode: number | string, classId?: number | string) =>
+    api.get<{
+      success: boolean;
+      data: {
+        meetingCode: string;
+        classId: number;
+        classProfileSummary: {
+          totalStudents: number;
+          approvedCount: number;
+          pendingCount: number;
+          rejectedCount: number;
+          unregisteredCount: number;
+        } | null;
+        session: import('../types').AttendanceSession | null;
+        myRecord: import('../types').AttendanceRecord | null;
+      };
+    }>(`/meetings/${meetingIdOrCode}/attendance/overview`, {
+      params: classId ? { classId } : undefined,
+    }),
+  start: (
+    meetingIdOrCode: number | string,
+    payload: {
+      classId?: number;
+      mode: 'once' | 'periodic';
+      windowSec?: number;
+      strictness?: 'relaxed' | 'balanced' | 'strict';
+      threshold?: number;
+      intervalMin?: number;
+      maxRounds?: number | null;
+      passRatio?: number;
+    },
+  ) =>
+    api.post<{ success: boolean; data: import('../types').AttendanceSession }>(
+      `/meetings/${meetingIdOrCode}/attendance/start`,
+      payload,
+    ),
+  check: (sessionId: number | string, frameBlob: Blob) => {
+    const formData = new FormData();
+    formData.append('frame', frameBlob, 'attendance.jpg');
+    return api.post<{
+      success: boolean;
+      data: {
+        status: 'present' | 'pending' | 'mismatch';
+        alreadyChecked?: boolean;
+        roundNo: number;
+        attempts: number;
+        attemptsLeft: number;
+        similarity?: number | null;
+        checkedAt?: string;
+        messageVi: string;
+      };
+    }>(`/attendance/${sessionId}/check`, formData);
+  },
+  end: (sessionId: number | string) =>
+    api.post<{ success: boolean; data: import('../types').AttendanceSession }>(
+      `/attendance/${sessionId}/end`,
+    ),
+  nextRound: (sessionId: number | string) =>
+    api.post<{ success: boolean; data: import('../types').AttendanceSession }>(
+      `/attendance/${sessionId}/next-round`,
+    ),
+  remind: (sessionId: number | string) =>
+    api.post<{ success: boolean; data: { remindedCount: number; missingStudentIds: number[] } }>(
+      `/attendance/${sessionId}/remind`,
+    ),
+  overrideRecord: (
+    sessionId: number | string,
+    studentId: number | string,
+    status: 'present' | 'absent' | 'excused',
+    reason: string,
+    roundNo?: number,
+  ) =>
+    api.put<{ success: boolean; data: import('../types').AttendanceSession }>(
+      `/attendance/${sessionId}/records/${studentId}`,
+      { status, reason, roundNo },
+    ),
+  getDetails: (sessionId: number | string) =>
+    api.get<{ success: boolean; data: import('../types').AttendanceSession }>(
+      `/attendance/${sessionId}`,
+    ),
+  exportFile: (
+    sessionId: number | string,
+    format: 'csv' | 'xlsx' = 'xlsx',
+  ) =>
+    api.get<Blob>(`/attendance/${sessionId}/export`, {
+      params: { format },
+      responseType: 'blob',
+    }),
+  fetchEvidenceBlob: (sessionId: number | string, studentId: number | string, roundNo?: number) =>
+    api.get<Blob>(`/attendance/${sessionId}/evidence/${studentId}`, {
+      params: roundNo ? { roundNo } : undefined,
+      responseType: 'blob',
+    }),
+};
+
+export { aiApi } from './ai';
+
+

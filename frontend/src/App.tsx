@@ -1,6 +1,7 @@
 import React, { Suspense, lazy, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, useParams, useNavigate } from 'react-router-dom';
 import { useAuthStore } from './store/authStore';
+import { useLayoutStore } from './store/layoutStore';
 import { classApi } from './api';
 
 // Pages (code-split by route to keep initial bundle small)
@@ -9,6 +10,8 @@ const DashboardPage = lazy(() => import('./pages/dashboard/DashboardPage'));
 const ClassPage = lazy(() => import('./pages/class/ClassPage'));
 const MeetingRoom = lazy(() => import('./pages/meeting/MeetingRoom'));
 const DocumentsPage = lazy(() => import('./pages/documents/DocumentsPage'));
+const FaceProfilePage = lazy(() => import('./pages/face/FaceProfilePage'));
+const SettingsPage = lazy(() => import('./pages/settings/SettingsPage'));
 const CreateExamWizard = lazy(() =>
   import('./pages/exam/CreateExamWizard').then((m) => ({ default: m.CreateExamWizard })),
 );
@@ -80,7 +83,12 @@ function LoadingScreen() {
 
 export default function App() {
   const { setAccessToken } = useAuthStore();
+  const { theme } = useLayoutStore();
   const [loading, setLoading] = React.useState(true);
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme || 'light');
+  }, [theme]);
 
   // On mount, try to refresh access token silently (uses httpOnly cookie)
   useEffect(() => {
@@ -116,6 +124,8 @@ export default function App() {
         {/* Protected */}
         <Route path="/" element={<ProtectedRoute><DashboardPage /></ProtectedRoute>} />
         <Route path="/documents" element={<ProtectedRoute><DocumentsPage /></ProtectedRoute>} />
+        <Route path="/face-profile" element={<ProtectedRoute><FaceProfilePage /></ProtectedRoute>} />
+        <Route path="/settings" element={<ProtectedRoute><SettingsPage /></ProtectedRoute>} />
         <Route path="/class/:id" element={<ProtectedRoute><ClassPage /></ProtectedRoute>} />
         <Route path="/class/:classId/meet/:meetingCode" element={<ProtectedRoute><MeetingRoom /></ProtectedRoute>} />
         <Route path="/join/:inviteCode" element={<ProtectedRoute><JoinClassRedirect /></ProtectedRoute>} />
