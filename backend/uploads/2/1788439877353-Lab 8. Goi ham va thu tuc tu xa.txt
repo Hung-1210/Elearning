@@ -1,2 +1,0 @@
-﻿Xây dựng chương trình chat bằng RMI.
-Xây dựng chương trình đồng bộ hóa 3 csdl trên 3 server.
